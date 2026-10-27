@@ -1,0 +1,32 @@
+# Full GTNH block zoo (`orch scene gtnh-zoo`): superflat, 16642 blocks of every mod on a 2-block grid at y=4,
+# x 0..258, z 0..256, ordered by block id (vanilla first, near the origin).
+world: gtnh-zoo
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: null       # report only until Phases 3/4 land
+
+views:
+  overview-flat:          # the whole zoo from above
+    position: [129, 5, 128]
+    distance: 180
+    mode: flat
+    ortho: 1
+  origin-perspective:     # first rows: vanilla and low block ids
+    position: [16, 5, 16]
+    distance: 40
+    rotation: 0.6
+    angle: 1.0
+  middle-perspective:     # centre of the grid
+    position: [129, 5, 128]
+    distance: 40
+    rotation: 0.6
+    angle: 1.0
+  far-corner-perspective: # last rows: highest block ids
+    position: [236, 5, 236]
+    distance: 40
+    rotation: 0.6
+    angle: 1.0

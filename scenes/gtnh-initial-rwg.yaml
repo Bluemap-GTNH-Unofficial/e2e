@@ -1,0 +1,22 @@
+# Initial GTNH realistic-world-gen overworld (copied from the server pack's first boot): 576 populated chunks,
+# hires tiles x -9..1, z -4..6 (blocks about x -286..66, z -126..226).
+world: gtnh-initial-rwg
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: null       # report only until Phases 2-4 land
+
+views:
+  overview-flat:          # all populated terrain from above
+    position: [-110, 64, 50]
+    distance: 250
+    mode: flat
+    ortho: 1
+  overview-perspective:   # terrain relief, 50 degrees down
+    position: [-110, 64, 50]
+    distance: 300
+    rotation: 0.6
+    angle: 0.9
