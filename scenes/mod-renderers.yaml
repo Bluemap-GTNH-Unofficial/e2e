@@ -1,4 +1,4 @@
-# Mod renderers (`orch scene mod-renderers`, testing/orchestrator/src/orchestrator/mod_scenes.py): superflat, stone
+# Mod renderers (`orch scene mod-renderers`, orchestrator/src/orchestrator/mod_scenes.py): superflat, stone
 # floor y=4, blocks from y=5. Chisel samples (3x3x3 cubes, pillars, rows) x 0..75 z 0..7; Iron Chests z 12..14;
 # BiblioCraft z 18..24; AE2 controller/drive + cable lines with parts z 30..38; EnderIO conduit lines z 42..58 and a
 # bundle line z 61..64; AE2 + EnderIO facades z 66..69. Renderers gtnh:chisel_ctm, gtnh:iron_chest, gtnh:bibliocraft, gtnh:ae2_cable_bus,

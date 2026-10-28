@@ -1,5 +1,5 @@
 # Community addon MTEs (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-machines`,
-# testing/orchestrator/src/orchestrator/addon_scenes.py): superflat, every MetaTileEntity of each addon (by class
+# orchestrator/src/orchestrator/addon_scenes.py): superflat, every MetaTileEntity of each addon (by class
 # package from `bmh mtes`; GTNL 21153 left out, it crashes the server when it ticks) on a 2-block grid at y=5, fronts
 # north (UP/DOWN when refused), one grid per addon along +x: TST x 0..26 z 0..24 (173), GTNL x 33..69 z 0..36 (360),
 # PH x 76..100 z 0..22 (153), 123T x 107..117 z 0..10 (34), NHU x 124..144 z 0..20 (119), Box++ x 151 z 0 (1).

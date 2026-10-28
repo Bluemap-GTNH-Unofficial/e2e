@@ -5,7 +5,7 @@ import pytest
 
 from e2e import metrics, paths
 
-MISSING_PNG = paths.REPO / "core/src/main/resourceExtensions/assets/bluemap/textures/block/missing.png"
+MISSING_PNG = paths.bluemap_repo() / "core/src/main/resourceExtensions/assets/bluemap/textures/block/missing.png"
 
 
 SKY = np.array((125, 171, 255), dtype=np.uint8)

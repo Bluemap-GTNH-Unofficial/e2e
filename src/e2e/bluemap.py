@@ -49,19 +49,27 @@ def java() -> str:
     return str(Path(home) / "bin" / "java")
 
 
-def _optional_addon_projects() -> list[str]:
+def _repo() -> Path:
+    repo = paths.bluemap_repo()
+    if not (repo / "settings.gradle.kts").is_file():
+        raise BlueMapError(f"BlueMap checkout not found at {repo}; clone it next to e2e or set BMGTNH_WORKSPACE")
+    return repo
+
+
+def _optional_addon_projects(repo: Path) -> list[str]:
     """Main-build projects that produce a BlueMap addon jar next to `:legacy` (present once they exist)."""
-    return [name for name in ("gtnh-render",) if (paths.REPO / name / "build.gradle.kts").is_file()]
+    return [name for name in ("gtnh-render",) if (repo / name / "build.gradle.kts").is_file()]
 
 
 def build(log: Path) -> None:
     """Builds the CLI shadow jar (with the webapp) and every addon jar in one Gradle invocation."""
-    tasks = [":cli:shadowJar", ":legacy:addonJar", *(f":{p}:addonJar" for p in _optional_addon_projects())]
+    repo = _repo()
+    tasks = [":cli:shadowJar", ":legacy:addonJar", *(f":{p}:addonJar" for p in _optional_addon_projects(repo))]
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w", encoding="utf-8") as out:
         result = subprocess.run(
             ["mise", "exec", "--", "./gradlew", "--console=plain", *tasks],
-            cwd=paths.REPO, stdout=out, stderr=subprocess.STDOUT,
+            cwd=repo, stdout=out, stderr=subprocess.STDOUT,
         )
     if result.returncode != 0:
         tail = "".join(log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-40:])
@@ -74,17 +82,18 @@ def _newest(directory: Path, pattern: str) -> Path | None:
 
 
 def locate_jars() -> Jars:
-    cli = _newest(paths.REPO / "implementations" / "cli" / "build" / "libs", "cli-*-shadow.jar")
+    repo = _repo()
+    cli = _newest(repo / "implementations" / "cli" / "build" / "libs", "cli-*-shadow.jar")
     if cli is None:
         raise BlueMapError("no CLI shadow jar; run without --no-build or `./gradlew :cli:shadowJar`")
     with zipfile.ZipFile(cli) as jar:
         if WEBAPP_ENTRY not in jar.namelist():
             raise BlueMapError(f"{cli} was built without the webapp (-x :common:buildWebapp); rebuild it")
-    legacy = _newest(paths.REPO / "legacy" / "build" / "libs", "*-addon.jar")
+    legacy = _newest(repo / "legacy" / "build" / "libs", "*-addon.jar")
     if legacy is None:
         raise BlueMapError("no :legacy addon jar; run without --no-build or `./gradlew :legacy:addonJar`")
     # optional addons are used when built (always the case after `build`)
-    optional = (_newest(paths.REPO / p / "build" / "libs", "*-addon.jar") for p in _optional_addon_projects())
+    optional = (_newest(repo / p / "build" / "libs", "*-addon.jar") for p in _optional_addon_projects(repo))
     return Jars(cli, (legacy, *(a for a in optional if a is not None)))
 
 
