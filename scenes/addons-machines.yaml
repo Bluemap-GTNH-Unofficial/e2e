@@ -1,0 +1,50 @@
+# Community addon MTEs (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-machines`,
+# testing/orchestrator/src/orchestrator/addon_scenes.py): superflat, every MetaTileEntity of each addon (by class
+# package from `bmh mtes`; GTNL 21153 left out, it crashes the server when it ticks) on a 2-block grid at y=5, fronts
+# north (UP/DOWN when refused), one grid per addon along +x: TST x 0..26 z 0..24 (173), GTNL x 33..69 z 0..36 (360),
+# PH x 76..100 z 0..22 (153), 123T x 107..117 z 0..10 (34), NHU x 124..144 z 0..20 (119), Box++ x 151 z 0 (1).
+# Renderer gtnh:gt_machine (gtnh-render gregtech) with the addon textures and casing pages from the GT dump.
+world: addons-machines
+extra_packs: [out/exporter-addons/bluemap-gtnh-resources-2.9.0-RC-2-addons.zip]
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: 0.005
+
+views:
+  overview-flat:          # every machine from above (top faces)
+    position: [76, 5, 18]
+    distance: 110
+    mode: flat
+    ortho: 1
+  tst-fronts:             # TST controllers and hatches, fronts north
+    position: [13, 5, 6]
+    distance: 24
+    rotation: 3.14159
+    angle: 1.15
+  gtnl-fronts:            # GTNL, first rows
+    position: [51, 5, 6]
+    distance: 26
+    rotation: 3.14159
+    angle: 1.15
+  gtnl-back-rows:         # GTNL, last rows (hatches, generators)
+    position: [51, 5, 30]
+    distance: 26
+    rotation: 3.14159
+    angle: 1.15
+    # GTNL's ninefold input hatches (21508..21518, row z=24) register iconsets/overlay_nine_hatch/{OVERLAY,NONE} but the
+    # jar ships iconsets/OVERLAY_NINE_HATCH/, so the game itself draws the missing texture on their fronts
+    max_missing: 0.015
+  ph-fronts:              # Programmable Hatches
+    position: [88, 5, 6]
+    distance: 22
+    rotation: 3.14159
+    angle: 1.15
+  oth-nhu-boxpp-fronts:   # 123Technology, NH Utilities, Box++
+    position: [128, 5, 6]
+    distance: 28
+    rotation: 3.14159
+    angle: 1.15
