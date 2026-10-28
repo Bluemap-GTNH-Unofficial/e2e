@@ -1,8 +1,19 @@
-# e2e
+# e2e: browser screenshot tests for BlueMap GTNH
 
-Browser end-to-end checks of rendered BlueMap GTNH maps (plan.md §4 "浏览器 e2e", §12). For each scene it renders
-a scene world with the BlueMap CLI, serves it, opens camera views in headless Chromium, and compares screenshots
-with approved baselines.
+> [!WARNING]
+> Unofficial: not affiliated with BlueMap or GT New Horizons. Vibe coded (written largely by an AI coding agent), no
+> quality guarantee, use at your own risk. See the
+> [umbrella repository](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH) for details.
+
+Part of [Bluemap-GTNH-Unofficial/BlueMap-GTNH](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH). Clone the
+umbrella with `git clone --recursive`; this repository expects its sibling checkouts (`BlueMap/`, `orchestrator/` and
+the workspace folders) next to it.
+
+Browser end-to-end checks of rendered BlueMap GTNH maps. For each scene it renders a scene world with the BlueMap CLI,
+serves it, opens camera views in headless Chromium, and compares screenshots with approved baselines. The baselines
+in `baselines/` are renders that contain Minecraft and mod textures; they are kept only to test the renderer.
+
+![GregTech pipes, one of the approved e2e views](https://raw.githubusercontent.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/main/docs/images/gt-pipes.jpg)
 
 ## Setup
 
@@ -11,9 +22,10 @@ uv sync --group dev
 uv run playwright install chromium   # once per machine (~100 MB, ~/Library/Caches/ms-playwright)
 ```
 
-Scene worlds come from the orchestrator (`uv run orch scene vanilla-zoo` etc. in `testing/orchestrator`) and live in
-`<workspace>/worlds/<scene>/`. The workspace defaults to the parent of `BlueMap-GTNH`; override with
-`BMGTNH_WORKSPACE`. Java: `mise where java@temurin-25.0.5+8.0.LTS`, override with `BMGTNH_JAVA=/path/to/java`.
+Scene worlds come from the orchestrator (`uv run orch scene vanilla-zoo` etc. in the sibling `orchestrator/` checkout)
+and live in `<workspace>/worlds/<scene>/`. The workspace defaults to the parent of this `e2e/` checkout; the BlueMap
+fork is expected next to it in `<workspace>/BlueMap`. Override the workspace with `BMGTNH_WORKSPACE`. Java:
+`mise where java@temurin-25.0.5+8.0.LTS`, override with `BMGTNH_JAVA=/path/to/java`.
 
 ## Commands
 
@@ -31,13 +43,13 @@ uv run --group dev pytest --scene vanilla-zoo --no-build       # e2e for one sce
 ## What `run` does per scene
 
 1. **Jars.** Unless `--no-build`: `./gradlew :cli:shadowJar :legacy:addonJar` (plus `:gtnh-render:addonJar` once
-   `gtnh-render/build.gradle.kts` exists) in `BlueMap-GTNH`, log in `out/e2e/build.log`. Then picks the newest
+   `gtnh-render/build.gradle.kts` exists) in `<workspace>/BlueMap`, log in `out/e2e/build.log`. Then picks the newest
    `implementations/cli/build/libs/cli-*-shadow.jar` (refused unless it contains the webapp) and the newest
    `*-addon.jar` of each addon project.
 2. **Config.** Wipes `out/e2e/<scene>/` and writes `config/` there: `accept-download: true`, data and webroot
    inside the scene folder, file storage, webserver on the first free port of `127.0.0.1:8200..8209`, addon jars and
-   `--packs`/`extra_packs` in `config/packs/`, and one map per dimension that has a non-empty region file (D17;
-   ids `overworld`, `the_nether`, `the_end`, `dim_<n>`; loader `gtnh:anvil_1_7`). Downloaded Minecraft client jars
+   `--packs`/`extra_packs` in `config/packs/`, and one map per dimension that has a non-empty region file
+   (ids `overworld`, `the_nether`, `the_end`, `dim_<n>`; loader `gtnh:anvil_1_7`). Downloaded Minecraft client jars
    are kept in `out/e2e/.cache/` and hard-linked into each scene's `data/`.
 3. **Render and serve.** One CLI process `-v 1.7.10 -r -f -g -w` (log `bluemap.log`). Ready once the log shows the
    render finished and saved ("Your maps are now all up-to-date!", then "Stopped.") and `settings.json` answers.
