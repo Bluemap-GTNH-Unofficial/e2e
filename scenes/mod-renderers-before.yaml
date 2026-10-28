@@ -80,3 +80,8 @@ views:
     distance: 9
     rotation: 0.5
     angle: 0.9
+  facades:                # AE2 facades (north + top of glass cables) and EnderIO bundle facades: stone, spruce planks, red wool, chisel
+    position: [5, 5, 67]
+    distance: 10
+    rotation: 3.14159
+    angle: 1.0
