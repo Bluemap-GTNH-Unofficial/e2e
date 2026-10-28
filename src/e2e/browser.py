@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from playwright.sync_api import Browser, ConsoleMessage, Playwright, Request, Response
+from playwright.sync_api import Browser, ConsoleMessage, Page, Playwright, Request, Response
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from e2e.scenes import View
@@ -56,6 +56,48 @@ FREEZE_ANIMATIONS_JS = """
         animation.step(0);
     }
     window.bluemap.mapViewer.redraw();
+}
+"""
+
+# The tile set the webapp ends up with depends on how the camera got there: it re-centres only after moving half a
+# view distance, and `removeFarTiles` keeps tiles anywhere in the view square while the spiral loader only requests
+# part of it, so tiles loaded around earlier centres survive at the far edge. Dropping every tile and loading
+# around the camera's final position makes the set a function of that position alone.
+RESET_TILES_JS = """
+() => {
+    const viewer = window.bluemap.mapViewer;
+    const map = viewer.map;
+    for (const manager of [map.hiresTileManager, ...map.lowresTileManager]) manager.removeAllTiles();
+    const position = viewer.controlsManager.position;
+    viewer.loadMapArea(position.x, position.z);
+}
+"""
+
+# MapHeightControls eases the camera's target and minimum heights towards the terrain height under the camera
+# (raycast against whatever tiles are loaded) and snaps once within 0.001. Converged = snapped to the current tiles.
+HEIGHTS_CONVERGED_JS = """
+() => {
+    const app = window.bluemap;
+    const manager = app.mapViewer.controlsManager;
+    const map = app.mapViewer.map;
+    if (manager.controls !== app.mapControls) return true;  // free flight: no height following
+    const heights = app.mapControls.mapHeight;
+    const target = map.terrainHeightAt(manager.position.x, manager.position.z) + 3 || 0;
+    if (heights.targetHeight !== target) return false;
+    if (app.mapControls.constructor.getMaxPerspectiveAngleForDistance(manager.distance) < 0.1) return true;
+    const camera = manager.camera.position;
+    return heights.cameraHeight === (map.terrainHeightAt(camera.x, camera.z) || 0);
+}
+"""
+
+# Re-applies the view's camera. Height following only ever raises `position.y`, so heights eased towards terrain of
+# transient tile sets (initial camera, lowres before hires) would otherwise stay in the final frame. The webapp
+# rewrites the URL hash with rounded values on every camera change, so the exact view hash is restored first
+# (`replaceState`: no hashchange event).
+REAPPLY_CAMERA_JS = """
+async (hash) => {
+    history.replaceState(undefined, undefined, "#" + hash);
+    await window.bluemap.loadPageAddress();
 }
 """
 
@@ -165,12 +207,17 @@ class Chromium:
         page.on("response", on_response)
         try:
             started = time.monotonic()
+            deadline = started + load_timeout
             page.goto(f"{base_url}#{view.hash}", wait_until="load")
-            try:
-                page.wait_for_function(TILES_SETTLED_JS, arg=view.map, timeout=load_timeout * 1000, polling="raf")
-                settled = True
-            except PlaywrightTimeoutError:
-                settled = False
+            # 1. the webapp's own loading, 2. a fresh tile set around the final camera position, 3. heights snapped to
+            # that tile set, 4. the hash camera re-applied on top (see the JS constants)
+            settled = _wait(page, TILES_SETTLED_JS, view.map, deadline)
+            if settled:
+                page.evaluate(RESET_TILES_JS)
+                settled = _wait(page, TILES_SETTLED_JS, view.map, deadline)
+            if settled:
+                settled = _wait(page, HEIGHTS_CONVERGED_JS, None, deadline)
+                page.evaluate(REAPPLY_CAMERA_JS, view.hash)
             loaded = time.monotonic()
             page.evaluate(FREEZE_ANIMATIONS_JS)
             result = page.evaluate(STABLE_FRAME_JS, [view.map, stable_frames, frame_gap, stable_timeout * 1000])
@@ -195,6 +242,18 @@ class Chromium:
             failed_requests=failed,
             missing_tiles=missing_tiles,
         )
+
+
+def _wait(page: Page, js: str, arg: object, deadline: float) -> bool:
+    """Polls `js` every animation frame until it is truthy or the deadline passes."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    try:
+        page.wait_for_function(js, arg=arg, timeout=remaining * 1000, polling="raf")
+    except PlaywrightTimeoutError:
+        return False
+    return True
 
 
 def _is_resource_404(message: str) -> bool:

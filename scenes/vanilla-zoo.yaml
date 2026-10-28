@@ -1,6 +1,7 @@
 # Vanilla block zoo (`orch scene vanilla-zoo`): superflat, 326 blocks on a 2-block grid at y=4,
 # x 0..36, z 0..34 (out/scenes/vanilla-zoo/scene.json dump_box).
 world: vanilla-zoo        # folder under <workspace>/worlds
+extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
 # maps: [overworld]       # default: one map per dimension with region files (D17)
 viewport: [1280, 720]
 
@@ -8,7 +9,7 @@ defaults:
   map: overworld
   tolerance: {pixel: 24, ratio: 0.005}
   min_content: 0.05
-  max_missing: null       # report only until Phase 2 lands; then set e.g. 0.001
+  max_missing: 0.001
 
 views:
   top-flat:               # whole grid, straight down, orthographic
