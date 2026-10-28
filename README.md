@@ -42,13 +42,18 @@ uv run --group dev pytest --scene vanilla-zoo --no-build       # e2e for one sce
 3. **Render and serve.** One CLI process `-v 1.7.10 -r -f -g -w` (log `bluemap.log`). Ready once the log shows the
    render finished and saved ("Your maps are now all up-to-date!", then "Stopped.") and `settings.json` answers.
 4. **Capture**, per view, in a fresh Chromium context (SwiftShader WebGL, so pixels do not depend on the host GPU):
-   open `http://127.0.0.1:<port>/#<map>:<x>:<y>:<z>:<distance>:<rotation>:<angle>:<tilt>:<ortho>:<mode>`, wait until
-   every tile manager (hires and each lowres LOD) has `currentlyLoading === 0` and holds a finished tile for every
-   cell its spiral loader would request (bound 120 s), pin texture animations to frame 0, then wait for 3
-   identical consecutive frames 2 animation frames apart (bound 60 s) and take `canvas.toDataURL()`
-   (`preserveDrawingBuffer` is on). A second frame of the same camera with only the skybox drawn is the "sky"
-   reference. Console errors (`console.error`, uncaught exceptions) and failed requests (network failures and
-   HTTP errors other than 404 on tiles outside the rendered area) are collected.
+   open `http://127.0.0.1:<port>/#<map>:<x>:<y>:<z>:<distance>:<rotation>:<angle>:<tilt>:<ortho>:<mode>` and wait
+   until every tile manager (hires and each lowres LOD) has `currentlyLoading === 0` and holds a finished tile for
+   every cell its spiral loader would request. The webapp's tile set and camera height then still depend on how
+   the camera got there (tiles loaded around earlier centres survive at the far edge of the view square; height
+   following only ever raises the camera), so the capture makes both a function of the view alone: drop every
+   tile and load around the final camera position, wait until settled again, wait until the height controls
+   have snapped to that tile set, and re-apply the exact view hash (the webapp rewrites the URL hash rounded). All
+   of this shares one bound of 120 s. Then pin texture animations to frame 0, wait for 3 identical consecutive
+   frames 2 animation frames apart (bound 60 s) and take `canvas.toDataURL()` (`preserveDrawingBuffer` is on).
+   Repeated runs give pixel-identical shots. A second frame of the same camera with only the skybox drawn is
+   the "sky" reference. Console errors (`console.error`, uncaught exceptions) and failed requests (network
+   failures and HTTP errors other than 404 on tiles outside the rendered area) are collected.
 5. **Check and report.** Writes `shots/<view>.png`, `shots/sky/<view>.png`, `diff/<view>.png` (failing views only:
    differing pixels in red over the dimmed shot) and `report.json`; prints a table.
 

@@ -9,7 +9,7 @@ defaults:
   map: overworld
   tolerance: {pixel: 24, ratio: 0.005}
   min_content: 0.05
-  max_missing: null
+  max_missing: 0.012      # purple pipe materials read as magenta (~0.7%)
 
 views:
   overview-flat:          # all sections from above

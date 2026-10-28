@@ -11,7 +11,7 @@ defaults:
   map: overworld
   tolerance: {pixel: 24, ratio: 0.005}
   min_content: 0.05
-  max_missing: null
+  max_missing: 0.005      # share of rendered pixels; purple materials read as magenta at ~0.1%
 
 views:
   overview-flat:          # every machine from above (top faces)
