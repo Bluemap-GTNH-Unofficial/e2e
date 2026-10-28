@@ -1,5 +1,5 @@
 # Community addon block zoo (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-zoo`,
-# testing/orchestrator/src/orchestrator/addon_scenes.py): superflat, one bmh zoo grid per addon at y=5 (stone floor
+# orchestrator/src/orchestrator/addon_scenes.py): superflat, one bmh zoo grid per addon at y=5 (stone floor
 # y=4), side by side along +x: TST x 0..26 z 0..26, GTNL x 32..54 z 0..22, PH x 60..76 z 0..14, 123T x 82..86 z 0..4,
 # NHU x 92..96 z 0..2, Box++ x 102..114 z 0..10. Addon jars: <workspace>/downloads/addons/versions.json.
 # The zoo also places metas the addons never use (TST MetaBlock01 1..15, SpaceTime* 3..15, ...: damageDropped(m) == m

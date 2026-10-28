@@ -1,5 +1,5 @@
 # Community addon multiblocks (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-multiblocks`,
-# testing/orchestrator/src/orchestrator/addon_scenes.py): structures built with StructureLib (survival, formed; Box++
+# orchestrator/src/orchestrator/addon_scenes.py): structures built with StructureLib (survival, formed; Box++
 # creative) around controllers at y=20, z=0, facing north, structures extending south; superflat ground at y=4.
 # Controllers at x: TST artificial star 0, laser meteor miner 35, large solar boiler 58, eye of wood 88, intensify
 # chemical distorter 117, magnetic mixer 139, miracle top 166; GTNL mega EBF 195, large circuit assembler 215, large
