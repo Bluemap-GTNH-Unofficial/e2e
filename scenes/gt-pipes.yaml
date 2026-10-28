@@ -1,0 +1,39 @@
+# GregTech pipes and cables (`orch scene gt-pipes`): superflat, y=5. Straight 3-block lines of every cable / pipe
+# x 0..106, z 0..102; junctions (5-block lines with branches) z 106..132; painted lines z 134..166.
+# Renderer gtnh:gt_machine (pipe geometry from thickness + mConnections).
+world: gt-pipes
+extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: null
+
+views:
+  overview-flat:          # all sections from above
+    position: [53, 5, 84]
+    distance: 180
+    mode: flat
+    ortho: 1
+  lines-cables:           # first rows: bare wires and insulated cables of rising thickness
+    position: [16, 5, 4]
+    distance: 16
+    rotation: 0.5
+    angle: 1.0
+  lines-pipes:            # fluid / item pipes
+    position: [40, 5, 70]
+    distance: 16
+    rotation: 0.5
+    angle: 1.0
+  junctions:              # branching pipes
+    position: [16, 5, 112]
+    distance: 16
+    rotation: 0.5
+    angle: 1.0
+  painted:                # painted cables and pipes
+    position: [16, 5, 140]
+    distance: 16
+    rotation: 0.5
+    angle: 1.0

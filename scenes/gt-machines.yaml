@@ -1,0 +1,73 @@
+# GregTech machines (`orch scene gt-machines`): superflat, every placeable gt.blockmachines MTE at y=5 on a 2-block grid.
+# North list x 0..80, z 0..80 (fronts north, a few up/down); south / east / west lists x 0..28 / 33..61 / 66..94,
+# z 85..113, fronts south / east / west. Renderer gtnh:gt_machine (gtnh-render gregtech).
+# Tiles touching the ungenerated chunk column x 96..111 (hires tiles x >= 64) are not rendered by BlueMap
+# (TileState.NOT_GENERATED), so the west list and the east end of the north list stay empty.
+world: gt-machines
+extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: null
+
+views:
+  overview-flat:          # every machine from above (top faces)
+    position: [47, 5, 57]
+    distance: 130
+    mode: flat
+    ortho: 1
+  north-fronts:           # first rows of the north list (hulls, transformers, hatches, steam machines), fronts north
+    position: [12, 5, 6]
+    distance: 22
+    rotation: 3.14159
+    angle: 1.15
+  south-fronts:           # south list, fronts south
+    position: [14, 5, 100]
+    distance: 22
+    rotation: 0
+    angle: 1.15
+  east-fronts:            # east list, fronts east
+    position: [47, 5, 100]
+    distance: 22
+    rotation: -1.5708
+    angle: 1.15
+  # free-flight close-ups: position = camera, rotation 0 looks north, angle pi/2 is horizontal
+  hulls-row0:             # north list row z=0: hull tiers 4..9 (x 16..26), front = energy-out overlay, north
+    position: [21, 6, -3]
+    rotation: 3.14159
+    angle: 1.45
+    distance: 0
+    mode: free
+  dynamo-hatches-row0:    # north list row z=0: ULV..HV dynamo hatches (x 46..56), north
+    position: [51, 6, -3]
+    rotation: 3.14159
+    angle: 1.45
+    distance: 0
+    mode: free
+  alloy-smelter-front:    # LV alloy smelter (mte 201) at (42, 5, 8): front north (mMainFacing), seen over row z=6
+    position: [42.5, 8, 5]
+    rotation: 3.14159
+    angle: 0.87
+    distance: 0
+    mode: free
+  alloy-smelter-output:   # the same machine from the south: output side (mFacing 3) with the pipe-out overlay
+    position: [42.5, 8, 12]
+    rotation: 0
+    angle: 0.87
+    distance: 0
+    mode: free
+  east-column61:          # east list column x=61 (pipeline, beamline / nanite / void hatches, jukebox), fronts east
+    position: [64, 6, 100]
+    rotation: -1.5708
+    angle: 1.45
+    distance: 0
+    mode: free
+  active-hatches:         # active machines: maintenance hatch (mte 90, x=2 z=4) and its row, north faces
+    position: [3, 8, 1]
+    rotation: 3.14159
+    angle: 0.87
+    distance: 0
+    mode: free
