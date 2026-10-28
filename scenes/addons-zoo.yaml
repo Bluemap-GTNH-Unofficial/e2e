@@ -1,0 +1,42 @@
+# Community addon block zoo (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-zoo`,
+# testing/orchestrator/src/orchestrator/addon_scenes.py): superflat, one bmh zoo grid per addon at y=5 (stone floor
+# y=4), side by side along +x: TST x 0..26 z 0..26, GTNL x 32..54 z 0..22, PH x 60..76 z 0..14, 123T x 82..86 z 0..4,
+# NHU x 92..96 z 0..2, Box++ x 102..114 z 0..10. Addon jars: <workspace>/downloads/addons/versions.json.
+# The zoo also places metas the addons never use (TST MetaBlock01 1..15, SpaceTime* 3..15, ...: damageDropped(m) == m
+# but no icon), which render as missing cubes.
+world: addons-zoo
+extra_packs: [out/exporter-addons/bluemap-gtnh-resources-2.9.0-RC-2-addons.zip]
+viewport: [1280, 720]
+
+defaults:
+  map: overworld
+  tolerance: {pixel: 24, ratio: 0.005}
+  min_content: 0.05
+  max_missing: 0.05       # report-only threshold: unused metas and TESR-only blocks render as missing
+
+views:
+  overview-flat:          # every addon grid from above
+    position: [57, 5, 13]
+    distance: 90
+    mode: flat
+    ortho: 1
+  tst:                    # Twist Space Technology
+    position: [13, 5, 13]
+    distance: 34
+    rotation: 0.6
+    angle: 1.0
+  gtnl:                   # GT: Not Leisure
+    position: [43, 5, 11]
+    distance: 30
+    rotation: 0.6
+    angle: 1.0
+  ph:                     # Programmable Hatches
+    position: [68, 5, 7]
+    distance: 22
+    rotation: 0.6
+    angle: 1.0
+  small-addons:           # 123Technology, NH Utilities, Box++
+    position: [98, 5, 5]
+    distance: 26
+    rotation: 0.6
+    angle: 1.0
