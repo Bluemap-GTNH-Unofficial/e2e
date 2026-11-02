@@ -1,4 +1,4 @@
-"""`e2e` command line: run scenes, approve baselines, list scenes and views."""
+"""`e2e` command line: run scenes, approve baselines, list scenes and views, run the rendering oracles."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from playwright.sync_api import sync_playwright
 
 from e2e import paths, runner, scenes
 from e2e.browser import Chromium
+from e2e.oracle import cli as oracle_cli
 
 
 def _print_scene(result: runner.SceneResult) -> None:
@@ -83,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     approve.set_defaults(func=cmd_approve)
 
     sub.add_parser("list", help="list scenes and their view URLs").set_defaults(func=cmd_list)
+
+    oracle_cli.register(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

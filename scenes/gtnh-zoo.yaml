@@ -31,3 +31,29 @@ views:
     distance: 40
     rotation: 0.6
     angle: 1.0
+
+oracle:
+  # Zoo metas whose client rendering throws (ArrayIndexOutOfBounds in getIcon/renderBlock: `render pass` errors of the
+  # state oracle, out/oracle/default/states/client/index.json, plus the client crash reports of the first capture).
+  # One such block fails its whole chunk's mesh, so the client would draw nothing; they are set to air for the
+  # capture and not judged. 111 cells.
+  exclude:
+    "AdvancedSolarPanel:BlockAdvSolarPanel": [5]
+    "Automagy:blockNetherRune": [7]
+    "BiomesOPlenty:coral2": [9]
+    "GalacticraftCore:tile.landingPad": [3]
+    "IC2NuclearControl:blockNuclearControlLight": [6, 8, 10, 12, 14]
+    "Natura:Natura.workbench": [13, 14, 15]
+    "StevesCarts:BlockDetector": [5, 6, 7, 13, 14, 15]
+    "TConstruct:explosive.slime": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "ThaumicHorizons:cloudGlowingTH": [10, 11, 12, 13, 14, 15]
+    "ThaumicHorizons:cloudTH": [10, 11, 12, 13, 14, 15]
+    "harvestcraft:sink": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "kekztech:kekztech_tfftstoragefield_block": [11, 12, 13, 14, 15]
+    "lootgames:LootGamesDungeonWall": [7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "miscutils:blockCactusCharcoal": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "miscutils:blockCactusCoke": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "miscutils:blockCompressedObsidian": [14, 15]
+    "miscutils:blockSugarCharcoal": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "miscutils:blockSugarCoke": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "thaumicbases:spike": [6]

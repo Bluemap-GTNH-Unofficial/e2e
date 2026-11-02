@@ -22,3 +22,12 @@ views:
     distance: 45
     rotation: 0.6
     angle: 0.9
+
+# World oracle (`e2e oracle world`): the perspective view above plus the grid from its four diagonals, so every side
+# face of every block is seen by two cameras.
+oracle:
+  cameras:
+    south-west: {eye: [2, 23, 33], look_at: [18, 5, 17]}
+    south-east: {eye: [34, 23, 33], look_at: [18, 5, 17]}
+    north-east: {eye: [34, 23, 1], look_at: [18, 5, 17]}
+    north-west: {eye: [2, 23, 1], look_at: [18, 5, 17]}
