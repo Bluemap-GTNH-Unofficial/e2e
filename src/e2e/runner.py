@@ -110,7 +110,9 @@ def _evaluate(scene: Scene, view: View, capture: Capture, out: Path, url: str) -
                     f"{result.diff_ratio:.4%} of pixels differ from the baseline by more than "
                     f"{view.tolerance.pixel} (allowed {view.tolerance.ratio:.4%}); diff {result.diff_image}")
     else:
-        result.failures.append(f"no baseline {baseline}; approve with `uv run e2e approve {scene.name} {view.name}`")
+        result.failures.append(
+            f"no baseline {baseline} (local regression baselines are not committed); review the screenshot {shot} "
+            f"and, if it looks right, run `uv run e2e approve {scene.name} {view.name}`")
 
     if measured.content_ratio < view.min_content:
         result.failures.append(f"only {measured.content_ratio:.2%} of pixels differ from the bare sky "

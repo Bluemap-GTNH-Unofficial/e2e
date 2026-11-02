@@ -10,10 +10,14 @@ umbrella with `git clone --recursive`; this repository expects its sibling check
 the workspace folders) next to it.
 
 Browser end-to-end checks of rendered BlueMap GTNH maps. For each scene it renders a scene world with the BlueMap CLI,
-serves it, opens camera views in headless Chromium, and compares screenshots with approved baselines. The baselines
-in `baselines/` are renders that contain Minecraft and mod textures; they are kept only to test the renderer.
+serves it, opens camera views in headless Chromium, and compares screenshots with locally approved baselines.
 
-![GregTech pipes, one of the approved e2e views](https://raw.githubusercontent.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/main/docs/images/gt-pipes.jpg)
+The baselines are a BlueMap-vs-BlueMap regression check only: they show that a render did not change since it was
+approved by eye, not that it is correct. Correctness comes from the oracle (`uv run e2e oracle ...`, in progress),
+which compares against the real GTNH client. Baselines contain Minecraft and mod textures, so they are never committed:
+they live in `<workspace>/baselines/<scene>/<view>.png` (override with `BMGTNH_BASELINES`) and are regenerated on
+demand. `e2e run` fails a view that has no baseline; review its screenshot in `<workspace>/out/e2e/<scene>/shots/` and
+then run `uv run e2e approve <scene> [view...]`.
 
 ## Setup
 
@@ -33,7 +37,7 @@ fork is expected next to it in `<workspace>/BlueMap`. Override the workspace wit
 uv run e2e run [scene...]            # all scenes by default; exit code 1 if any check fails
 uv run e2e run vanilla-zoo --no-build   # reuse the jars already built
 uv run e2e run gtnh-zoo --packs /path/to/exported-packs   # extra resource packs (file, or directory of packs)
-uv run e2e approve <scene> [view...]  # copy the latest screenshots to baselines/<scene>/<view>.png
+uv run e2e approve <scene> [view...]  # copy the latest screenshots to <workspace>/baselines/<scene>/<view>.png
 uv run e2e list                       # scenes, views and their URL hashes
 uv run --group dev pytest             # unit tests + one e2e test per scene view and per scene log
 uv run --group dev pytest -m "not e2e"                         # unit tests only (seconds)
@@ -111,5 +115,5 @@ views:
     mode: flat              # perspective | flat | free
 ```
 
-Baselines in `baselines/<scene>/` are smoke baselines of the renderer state when they were approved; re-approve
-after intentional rendering changes and review the new PNGs in the diff.
+Baselines in `<workspace>/baselines/<scene>/` record the renderer state when they were approved; re-approve after
+intentional rendering changes, after reviewing the new screenshots.

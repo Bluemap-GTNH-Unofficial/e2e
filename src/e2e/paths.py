@@ -7,7 +7,6 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[2]  # src/e2e/paths.py -> src -> e2e repo
 SCENES_DIR = PROJECT / "scenes"
-BASELINES_DIR = PROJECT / "baselines"
 
 
 def workspace() -> Path:
@@ -38,5 +37,11 @@ def download_cache() -> Path:
     return out_dir() / ".cache"
 
 
+def baselines_dir() -> Path:
+    """Local BlueMap-vs-BlueMap regression baselines, never committed; override with BMGTNH_BASELINES."""
+    env = os.environ.get("BMGTNH_BASELINES")
+    return Path(env) if env else workspace() / "baselines"
+
+
 def baseline(scene: str, view: str) -> Path:
-    return BASELINES_DIR / scene / f"{view}.png"
+    return baselines_dir() / scene / f"{view}.png"
