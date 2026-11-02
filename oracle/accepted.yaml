@@ -1,0 +1,85 @@
+# Accepted 1.13 differences of the rendering oracles (`e2e oracle states|world`).
+#
+# BlueMap draws vanilla blocks from the 1.13 client jar's textures and models on purpose. States listed here are
+# reported as "accepted (1.13)" instead of passing or failing, but only where the 1.7.10 vs 1.13 data of
+# `src/e2e/oracle/vanilla.py` (out/oracle/default/states/vanilla.json) shows the entry's reason for that state in
+# the variant at hand; otherwise the state is judged as usual and reported as unbacked.
+#
+# Pattern: `minecraft:<1.7.10 block>` (every meta) or `minecraft:<block>[meta=0,2,4-8]`.
+format: 1
+reasons:
+  texture: >-
+    BlueMap draws a 1.13 texture that differs from the 1.7.10 texture it replaces (client jars compared frame 0
+    through modernity/data/renames-1.7.10-to-1.13.json), or one 1.7.10 has no source for
+  random_offset: BlueMap moves the 1.13 model by a position hash (randomOffset); 1.7.10 does not offset it
+  random_variant: >-
+    the 1.13 blockstate picks one of several models or rotations by position (the stone rotation); 1.7.10 always
+    draws one
+  flattening_drop: the 1.13 upgrade turns the state into air (BlueMap draws nothing) while the 1.7.10 client draws it
+# Minimal: only vanilla states that fail a calibrated threshold in some state or world report (2026-11-02 runs of
+# the default, modernity and addons variants) and whose failure the data explains. A differing texture is accepted
+# only where the state's geometry matches the 1.7.10 client's (vanilla.json `sameGeometry`), so a texture entry
+# cannot hide a shape difference.
+accepted:
+  # BlueMap draws 1.13 textures that differ from the 1.7.10 ones (frame 0 compared through the rename table)
+  - states: minecraft:wool
+    reason: texture
+    note: all 16 block/<colour>_wool textures differ from 1.7.10 wool_colored_<colour>
+  - states: minecraft:carpet
+    reason: texture
+    note: drawn with the 16 block/<colour>_wool textures, which differ from 1.7.10
+  - states: minecraft:trapdoor
+    reason: texture
+    note: block/oak_trapdoor differs from 1.7.10 trapdoor
+  - states: minecraft:command_block
+    reason: texture
+    note: 1.13 command block front/back/side/conditional textures; 1.7.10 has one command_block texture
+  - states: minecraft:stone[meta=1-6]
+    reason: texture
+    note: granite, diorite, andesite and their polished forms (1.8); no 1.7.10 texture, the client draws stone
+  - states: minecraft:dirt[meta=1]
+    reason: texture
+    note: coarse dirt (1.8); no 1.7.10 texture, the client draws dirt
+  - states: minecraft:sponge[meta=1]
+    reason: texture
+    note: wet sponge (1.8); no 1.7.10 texture, the client draws sponge
+  # 1.13 blockstates with a list of models or rotations, picked by position
+  - states: minecraft:stone[meta=0]
+    reason: random_variant
+    note: block/stone and block/stone_mirrored at y 0/180 (the stone rotation; most world floors)
+  - states: minecraft:grass
+    reason: random_variant
+    note: grass_block (snowy=false) at y 0/90/180/270
+  - states: minecraft:dirt[meta=0]
+    reason: random_variant
+    note: block/dirt at y 0/90/180/270
+  - states: minecraft:sand
+    reason: random_variant
+    note: sand and red_sand at y 0/90/180/270
+  - states: minecraft:netherrack
+    reason: random_variant
+    note: netherrack at x/y rotations
+  - states: minecraft:bedrock
+    reason: random_variant
+    note: bedrock and bedrock_mirrored at y 0/180
+  - states: minecraft:waterlily
+    reason: random_variant
+    note: lily_pad at y 0/90/180/270
+  # random XZ(Y) model offsets of 1.13 plants
+  - states: minecraft:red_flower
+    reason: random_offset
+  - states: minecraft:yellow_flower
+    reason: random_offset
+  - states: minecraft:tallgrass[meta=1-2]
+    reason: random_offset
+    note: grass and fern
+  - states: minecraft:double_plant[meta=0-2,4-5]
+    reason: random_offset
+    note: sunflower, lilac, tall grass (lower half), rose bush, peony
+  # the 1.13 upgrade drops the state to air
+  - states: minecraft:bed
+    reason: flattening_drop
+    note: a bed half without its other half (each state is drawn alone)
+  - states: minecraft:vine[meta=1-15]
+    reason: flattening_drop
+    note: vines without a supporting block (each state is drawn alone)

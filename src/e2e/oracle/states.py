@@ -11,9 +11,13 @@ Per variant (outputs in ``out/oracle/<variant>/states/``, never committed):
 3. Comparison per view: the whole view (``view`` thresholds) and each axis face, by the face IDs of both sides
    (``face`` thresholds), with the shared region metrics (``oracle.metrics``).
 4. ``report.json`` and ``report.html`` (pass rates per mod, worst states first with reference / BlueMap / diff).
+   States ``oracle/accepted.yaml`` names, where the 1.7.10 vs 1.13 data (``oracle.vanilla``) backs the reason, are
+   reported as ``accepted (1.13)``, neither passing nor failing.
 
-Thresholds come from the vanilla states of the default variant (``out/oracle/default/states/calibration.json``,
-Tukey's far-out fences over that distribution, ``metrics.calibrate``): that run writes it, every other run reads it.
+Thresholds come from the vanilla states of the default variant that look the same in 1.7.10 and 1.13
+(``out/oracle/default/states/calibration.json``, Tukey's far-out fences over their inexact samples,
+``metrics.calibrate``): that run classifies the vanilla states (``vanilla.json``) and writes the calibration, every
+other run reads both. ``e2e oracle swap-test`` measures how many genuinely different renders the thresholds flag.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import numpy as np
 from PIL import Image
 
 from e2e import bluemap, paths
-from e2e.oracle import metrics, states_report, variants
+from e2e.oracle import accepted, metrics, states_report, vanilla, variants
 
 VIEWS = ("se", "nw")
 VIEW_SIZE = 128
@@ -43,14 +47,6 @@ JUDGED_FACES = (1, 2, 3, 4, 5, 6)
 CALIBRATION_VARIANT = "default"
 MIN_PIXELS = 32  # regions whose coverage union is smaller are reported but not judged
 WORST = 100  # worst states with images in the report
-
-# Vanilla metas that Mojang's 1.13 flattening table knows but 1.7.10 does not have (the 1.7.10 client draws the
-# block's base state for them): excluded from the calibration, still compared and listed.
-NOT_IN_1_7_10 = {
-    **{("minecraft:stone", m): "granite/diorite/andesite were added in 1.8" for m in range(1, 7)},
-    ("minecraft:dirt", 1): "coarse dirt was added in 1.8",
-    ("minecraft:sponge", 1): "wet sponge was added in 1.8",
-}
 
 
 def states_dir(variant: variants.Variant | str) -> Path:
@@ -203,29 +199,66 @@ def _views_json(views: dict) -> dict:
     }
 
 
-def calibrate(results: list[dict], raw: dict[str, dict]) -> tuple[Judge, dict]:
-    """Thresholds from the comparable vanilla states: both sides drew the state (status still ``pending``) and it
-    exists in 1.7.10."""
-    view_samples, face_samples, used = [], [], []
-    for r in results:
-        if r["mod"] != "minecraft" or r["status"] != "pending" or (r["name"], r["meta"]) in NOT_IN_1_7_10:
-            continue
-        used.append(r["key"])
+def _regions(rs: list[dict], raw: dict[str, dict]) -> dict[str, tuple[list, list[str]]]:
+    """View and face regions of ``rs`` with the block each belongs to."""
+    out: dict[str, tuple[list, list[str]]] = {"view": ([], []), "face": ([], [])}
+    for r in rs:
         for data in raw[r["path"]].values():
-            view_samples.append(data["overall"])
-            face_samples += [m for f, m in data["faces"].items() if f in JUDGED_FACES]
-    view_cal = metrics.calibrate(view_samples, min_pixels=MIN_PIXELS)
-    face_cal = metrics.calibrate(face_samples, min_pixels=MIN_PIXELS)
+            out["view"][0].append(data["overall"])
+            out["view"][1].append(r["name"])
+            for f, m in data["faces"].items():
+                if f in JUDGED_FACES:
+                    out["face"][0].append(m)
+                    out["face"][1].append(r["name"])
+    return out
+
+
+def calibration_sets(results: list[dict], classes: dict, accepted_list: accepted.Accepted) -> dict[str, list[dict]]:
+    """The ``texture`` and ``geometry`` sets of the 1.7.10 vs 1.13 classification (``oracle.vanilla``), limited to
+    states both sides drew (status still ``pending``) that ``accepted.yaml`` does not name."""
+    by_key = {r["key"]: r for r in results}
+    return {name: [by_key[k] for k in classes["sets"][name] if k in by_key and by_key[k]["status"] == "pending"
+                   and accepted_list.entry(by_key[k]["name"], by_key[k]["meta"]) is None]
+            for name in ("texture", "geometry")}
+
+
+def false_failures(judge: Judge, sets: dict[str, list[dict]], raw: dict[str, dict]) -> dict:
+    """Per calibration set: the states the thresholds fail (every one of them looks the same in 1.7.10 and 1.13)."""
+    out = {}
+    for name, rs in sets.items():
+        failing = [(r["key"], judge.check(raw[r["path"]])) for r in rs]
+        failing = [(k, c) for k, c in failing if c]
+        out[name] = {"states": len(rs), "fail": len(failing), "rate": len(failing) / len(rs) if rs else None,
+                     "failing": [{"key": k, "checks": c[:4]} for k, c in failing]}
+    return out
+
+
+def calibrate(results: list[dict], raw: dict[str, dict], classes: dict,
+              accepted_list: accepted.Accepted) -> tuple[Judge, dict]:
+    """Thresholds from the vanilla states that look the same in 1.7.10 and 1.13: IoU over the regions of the
+    ``geometry`` set, delta E and SSIM over the ``texture`` set with one sample per block, its worst inexact region
+    (``calibration_sets``, ``metrics.calibrate``)."""
+    sets = calibration_sets(results, classes, accepted_list)
+    geometry, texture = _regions(sets["geometry"], raw), _regions(sets["texture"], raw)
+    view_cal, face_cal = (metrics.calibrate(texture[level][0], geometry_samples=geometry[level][0],
+                                            groups=texture[level][1], min_pixels=MIN_PIXELS)
+                          for level in ("view", "face"))
+    judge = Judge(view_cal.thresholds, face_cal.thresholds)
     data = {
-        "format": 1,
+        "format": 2,
         "variant": CALIBRATION_VARIANT,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "states": len(used),
-        "excluded": {f"{n}[meta={m}]": why for (n, m), why in NOT_IN_1_7_10.items()},
+        "states": len(sets["texture"]),
+        "geometryStates": len(sets["geometry"]),
+        "classification": str(vanilla.file()),
+        "geometryBand": classes["geometryBand"],
+        "sets": {name: [r["key"] for r in rs] for name, rs in sets.items()},
+        "excluded": {f"{n}[meta={m}]": why for (n, m), why in vanilla.NOT_IN_1_7_10.items()},
         "view": view_cal.to_json(),
         "face": face_cal.to_json(),
+        "falseFailures": false_failures(judge, sets, raw),
     }
-    return Judge(view_cal.thresholds, face_cal.thresholds), data
+    return judge, data
 
 
 def load_judge(file: Path) -> Judge:
@@ -292,8 +325,8 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
                                                "blank", "error") if bm.get(k) is not None},
             "checks": [],
         }
-        if (name, s["meta"]) in NOT_IN_1_7_10:
-            result["note"] = NOT_IN_1_7_10[(name, s["meta"])]
+        if (name, s["meta"]) in vanilla.NOT_IN_1_7_10:
+            result["note"] = vanilla.NOT_IN_1_7_10[(name, s["meta"])]
         views = raw.get(s["path"])
         if s.get("error"):
             result["status"] = "client_error"
@@ -314,17 +347,19 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
             result["score"] = round(score(views), 4)
         results.append(result)
 
+    classes = classification(variant, {**client_index, "states": states}, bluemap_index, out, write=not only)
+    accepted_list = accepted.load(classes, vanilla.texture_overrides(variant.bluemap_packs))
     calibration_written = False
     provisional = False
     if variant.name == CALIBRATION_VARIANT and not only and (recalibrate or not calibration_file().is_file()):
-        judge, calibration = calibrate(results, raw)
+        judge, calibration = calibrate(results, raw, classes, accepted_list)
         calibration_file().write_text(json.dumps(calibration, indent=1), encoding="utf-8")
         calibration_written = True
     elif calibration_file().is_file():
         judge = load_judge(calibration_file())
     elif variant.name == CALIBRATION_VARIANT:
         # a subset run before any full run: judge with thresholds from the subset's vanilla states, write nothing
-        judge, _ = calibrate(results, raw)
+        judge, _ = calibrate(results, raw, classes, accepted_list)
         provisional = True
         print("[states] no calibration yet: provisional thresholds from this subset's vanilla states", flush=True)
     else:
@@ -333,8 +368,14 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
     for r in results:
         if r["status"] != "pending":
             continue
-        views = raw[r["path"]]
-        r["checks"] = judge.check(views)
+        r["checks"] = judge.check(raw[r["path"]])
+        entry, backed = accepted_list.check(r["name"], r["meta"])
+        if entry is not None and backed:
+            r["status"] = "accepted"
+            r["accepted"] = accepted_list.describe(entry)
+            continue
+        if entry is not None:
+            r["acceptedUnbacked"] = entry.states
         r["status"] = "fail" if r["checks"] else "pass"
     for r in results:
         if r["status"] in ("fail", "client_blank", "bluemap_missing"):
@@ -350,13 +391,19 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
     })
     report["calibrationWritten"] = calibration_written
     report["provisionalThresholds"] = provisional
+    report["accepted"] = {
+        "file": str(accepted.FILE), "entries": len(accepted_list.entries),
+        "states": sum(r["status"] == "accepted" for r in results),
+        "unbacked": [r["key"] for r in results if r.get("acceptedUnbacked")],
+        "unmatched": accepted_list.unmatched(),
+    }
     (out / "report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     states_report.write(out, report, results, diff_image)
     totals = report["total"]
     print(f"[states] {variant.name}: {totals['pass']}/{totals['judged']} judged states pass "
-          f"({totals['passRate']:.2%}); {totals['clientBlank']} client-blank, {totals['clientError']} client errors, "
-          f"{totals['bluemapMissing']} without BlueMap output; compare {t_end - t_compare:.0f}s; "
-          f"report {out / 'report.html'}")
+          f"({totals['passRate']:.2%}), {totals['accepted']} {accepted.LABEL}; {totals['clientBlank']} client-blank, "
+          f"{totals['clientError']} client errors, {totals['bluemapMissing']} without BlueMap output; compare "
+          f"{t_end - t_compare:.0f}s; report {out / 'report.html'}")
     return 0 if totals["fail"] == 0 else 1
 
 
@@ -366,8 +413,9 @@ def summarize(variant: variants.Variant, results: list[dict], judge: Judge, clie
         c = Counter(r["status"] for r in rs)
         judged = c["pass"] + c["fail"]
         return {"states": len(rs), "judged": judged, "pass": c["pass"], "fail": c["fail"],
-                "passRate": c["pass"] / judged if judged else None, "clientBlank": c["client_blank"],
-                "clientError": c["client_error"], "bluemapMissing": c["bluemap_missing"]}
+                "passRate": c["pass"] / judged if judged else None, "accepted": c["accepted"],
+                "clientBlank": c["client_blank"], "clientError": c["client_error"],
+                "bluemapMissing": c["bluemap_missing"]}
 
     by_mod = defaultdict(list)
     for r in results:
@@ -375,7 +423,7 @@ def summarize(variant: variants.Variant, results: list[dict], judge: Judge, clie
     failing = sorted((r for r in results if r["status"] == "fail"), key=lambda r: -r.get("score", 0))
     causes = Counter(r.get("cause", "") for r in failing)
     return {
-        "format": 1,
+        "format": 2,
         "variant": variant.name,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "bluemapPacks": [str(p) for p in variant.bluemap_packs],
@@ -391,9 +439,92 @@ def summarize(variant: variants.Variant, results: list[dict], judge: Judge, clie
         "worst": [{k: r.get(k) for k in ("key", "mod", "score", "checks", "cause", "client", "bluemap")} for r in failing[:WORST]],
         "worstBlocks": [{k: r.get(k) for k in ("key", "mod", "score", "checks", "cause", "client", "bluemap")}
                         for r in states_report.worst_per_block(failing)[:WORST]],
-        "states": [{k: r.get(k) for k in ("key", "status", "score", "cause", "note")} | {"checks": r["checks"][:6]}
-                   for r in results],
+        "states": [{k: r.get(k) for k in ("key", "status", "score", "cause", "note", "accepted", "acceptedUnbacked")
+                    if r.get(k) is not None} | {"checks": r["checks"][:6]} for r in results],
     }
+
+
+def classification(variant: variants.Variant, client_index: dict, bluemap_index: dict, out: Path, *,
+                   write: bool) -> dict:
+    """The 1.7.10 vs 1.13 classification of the vanilla states (``oracle.vanilla``): computed by the default variant
+    (written with the full state set), read by every other variant."""
+    if variant.name != CALIBRATION_VARIANT:
+        return vanilla.load()
+    classes = vanilla.classify(client_index, bluemap_index, out / "client", out / "bluemap", vanilla.sources(),
+                               len(VIEWS))
+    if write:
+        vanilla.file().write_text(json.dumps(classes, indent=1), encoding="utf-8")
+    return classes
+
+
+# --- swap test -----------------------------------------------------------------------------------------------------
+
+SWAP_MIN_DIFFERENCE = 1.0  # mean absolute RGBA difference from which two client renders count as different
+
+
+def _swap_job(job: tuple[str, str, str]) -> tuple[str, dict | None]:
+    path, reference_root, test_root = job
+    try:
+        ref = load_rgba(Path(reference_root) / f"{path}.png")
+        test = load_rgba(Path(test_root) / f"{path}.png")
+        if np.abs(ref.astype(np.int16) - test.astype(np.int16)).mean() < SWAP_MIN_DIFFERENCE:
+            return path, None
+        return path, compare_images(ref, test, load_faces(Path(reference_root) / f"{path}.faces.png"),
+                                    load_faces(Path(test_root) / f"{path}.faces.png"))
+    except (OSError, ValueError):
+        return path, None
+
+
+def swap_test(judges: dict[str, Judge], workers: int) -> dict:
+    """Detection power of thresholds: the Modernity client's render of every state is the reference and the default
+    client's render of the same state the test, for the states whose two renders differ (mean absolute RGBA difference
+    at least ``SWAP_MIN_DIFFERENCE``). Every such state looks different, so a discriminating oracle flags all of them.
+    Also the false failures of each judge on the current calibration sets (states that look the same)."""
+    reference, test = states_dir("modernity") / "client", states_dir(CALIBRATION_VARIANT) / "client"
+    index = json.loads((test / "index.json").read_text(encoding="utf-8"))["states"]
+    jobs = [(s["path"], str(reference), str(test)) for s in index if not s.get("error") and not s.get("blank")]
+    differing: dict[str, dict] = {}
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for path, views in pool.map(_swap_job, jobs, chunksize=64):
+            if views is not None:
+                differing[path] = views
+    calibration = json.loads(calibration_file().read_text(encoding="utf-8"))
+    keys = {name: set(calibration["sets"][name]) for name in ("texture", "geometry")}
+    by_key = {s["key"]: s["path"] for s in index}
+    out = states_dir(CALIBRATION_VARIANT)
+    calibration_raw = {}
+    for path, views, _ in map(_compare_job, [(by_key[k], str(out / "client"), str(out / "bluemap"))
+                                             for k in set().union(*keys.values())]):
+        if views is not None:
+            calibration_raw[path] = views
+    result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "differingStates": len(differing),
+              "minDifference": SWAP_MIN_DIFFERENCE, "judges": {}}
+    for name, judge in judges.items():
+        flagged = sum(bool(judge.check(views)) for views in differing.values())
+        ff = {}
+        for set_name, members in keys.items():
+            failing = [k for k in members if by_key[k] in calibration_raw and judge.check(calibration_raw[by_key[k]])]
+            ff[set_name] = {"states": len(members), "fail": len(failing),
+                            "rate": len(failing) / len(members) if members else None}
+        result["judges"][name] = {"thresholds": judge.to_json(), "flagged": flagged,
+                                  "detection": flagged / len(differing) if differing else None, "falseFailures": ff}
+    return result
+
+
+def cmd_swap_test(args: argparse.Namespace) -> int:
+    judges = {"current": load_judge(calibration_file())}
+    if args.before:
+        judges = {"before": load_judge(args.before), **judges}
+    result = swap_test(judges, args.workers)
+    target = states_dir(CALIBRATION_VARIANT) / "swap-test.json"
+    target.write_text(json.dumps(result, indent=1), encoding="utf-8")
+    for name, j in result["judges"].items():
+        ff = j["falseFailures"]
+        print(f"[swap-test] {name}: flags {j['flagged']}/{result['differingStates']} differing states "
+              f"({j['detection']:.1%}); false failures on the calibration sets: texture {ff['texture']['fail']}/"
+              f"{ff['texture']['states']}, geometry {ff['geometry']['fail']}/{ff['geometry']['states']}")
+    print(f"[swap-test] {target}")
+    return 0
 
 
 def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
@@ -405,6 +536,11 @@ def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
                    help=f"recompute the thresholds from this run's vanilla states (variant {CALIBRATION_VARIANT} only)")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="comparison processes")
     p.set_defaults(func=cmd_states)
+    s = oracle_sub.add_parser("swap-test", help="detection power of the state thresholds: Modernity client renders "
+                                                "against default client renders of the same states")
+    s.add_argument("--before", type=Path, help="also evaluate the thresholds of this earlier calibration.json")
+    s.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="comparison processes")
+    s.set_defaults(func=cmd_swap_test)
 
 
 def cmd_states(args: argparse.Namespace) -> int:

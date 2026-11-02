@@ -7,15 +7,21 @@ may have their own region (e.g. the pixels each renderer attributes to the block
 
 Per region:
 
-- ``iou``: intersection over union of the two coverages (geometry/silhouette agreement), 1.0 if both are empty.
+- ``iou``: intersection over union of the two coverages (geometry/silhouette agreement) with a boundary tolerance of
+  ``IOU_TOLERANCE_PX``: a covered pixel matches when the other coverage has a pixel within that many pixels
+  (8-neighbourhood), so ``iou = 1 - unmatched / union``. Rasterisation rules of the client (OpenGL) and BlueMap
+  differ by up to a pixel at edges, which an exact IoU counts heavily against small and thin regions; a mismatch
+  band wider than the tolerance still counts beyond its first pixel. 1.0 if both are empty.
 - ``delta_e``: mean CIEDE2000 colour difference over pixels covered in both, ``delta_e_p95`` its 95th percentile.
 - ``ssim``: structural similarity of the luminance (Wang et al. 2004, 7x7 uniform window, K1 0.01, K2 0.03) on the
   bounding box of the union of both coverages, block-mean downsampled by ``ssim_downsample``; each image is first
-  composited over mid-grey with everything outside its coverage set to mid-grey, and the SSIM map is averaged over
-  the downsampled union. NaN if the box is smaller than the window after downsampling.
+  composited over mid-grey with everything outside the pixels both coverages cover set to mid-grey, and the SSIM map
+  is averaged over the downsampled common pixels: coverage differences are the IoU's and are not counted twice.
+  NaN if the box is smaller than the window after downsampling or no window centre is covered by both.
 
-[Thresholds] turns metrics into pass/fail; [calibrate] derives thresholds from a sample distribution (the vanilla
-blocks of the default pack) with Tukey's far-out fences, so they are never tuned by hand.
+[Thresholds] turns metrics into pass/fail; [calibrate] derives thresholds from a sample distribution (vanilla blocks
+that look the same in 1.7.10 and in the 1.13 assets BlueMap draws them from) with Tukey's far-out fences over the
+samples that are not exact agreements, so they are never tuned by hand.
 """
 
 from __future__ import annotations
@@ -150,11 +156,28 @@ def ssim(ref_luma: np.ndarray, test_luma: np.ndarray, weight: np.ndarray | None 
     return float(smap.mean())
 
 
+IOU_TOLERANCE_PX = 1
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Binary dilation by a (2 radius + 1)^2 square (8-neighbourhood for radius 1)."""
+    if radius <= 0:
+        return mask
+    h, w = mask.shape
+    padded = np.pad(mask, radius)
+    out = np.zeros_like(mask)
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            out |= padded[dy:dy + h, dx:dx + w]
+    return out
+
+
 def compare_region(ref_rgba: np.ndarray, test_rgba: np.ndarray, ref_region: np.ndarray | None = None,
                    test_region: np.ndarray | None = None, *, alpha_min: int = ALPHA_MIN,
-                   ssim_downsample: int = SSIM_DOWNSAMPLE) -> RegionMetrics:
+                   ssim_downsample: int = SSIM_DOWNSAMPLE, colour_excluded: np.ndarray | None = None) -> RegionMetrics:
     """Compares two straight-alpha RGBA images inside their regions (``test_region`` defaults to ``ref_region``,
-    ``None`` is the whole image)."""
+    ``None`` is the whole image). ``colour_excluded`` pixels count for the coverage (IoU) but not for delta E and
+    SSIM (their colour is known to come from something else, e.g. a differing surface behind translucent glass)."""
     if ref_rgba.shape != test_rgba.shape or ref_rgba.ndim != 3 or ref_rgba.shape[2] != 4:
         raise ValueError(f"need two RGBA images of the same size, got {ref_rgba.shape} and {test_rgba.shape}")
     if test_region is None:
@@ -166,23 +189,28 @@ def compare_region(ref_rgba: np.ndarray, test_rgba: np.ndarray, ref_region: np.n
     if test_region is not None:
         test_cov &= test_region
     both = ref_cov & test_cov
+    coloured = both if colour_excluded is None else both & ~colour_excluded
     union = ref_cov | test_cov
     n_ref, n_test, n_both, n_union = int(ref_cov.sum()), int(test_cov.sum()), int(both.sum()), int(union.sum())
-    iou = n_both / n_union if n_union else 1.0
+    if n_union:
+        unmatched = (ref_cov & ~_dilate(test_cov, IOU_TOLERANCE_PX)) | (test_cov & ~_dilate(ref_cov, IOU_TOLERANCE_PX))
+        iou = 1.0 - int(unmatched.sum()) / n_union
+    else:
+        iou = 1.0
 
-    if n_both:
-        de = ciede2000(srgb_to_lab(ref_rgba[..., :3][both]), srgb_to_lab(test_rgba[..., :3][both]))
+    if coloured.any():
+        de = ciede2000(srgb_to_lab(ref_rgba[..., :3][coloured]), srgb_to_lab(test_rgba[..., :3][coloured]))
         delta_e, delta_e_p95 = float(de.mean()), float(np.percentile(de, 95))
     else:
         delta_e = delta_e_p95 = math.nan
 
     structural = math.nan
-    if n_union:
+    if coloured.any():
         rows, cols = np.nonzero(union)
         box = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
-        ref_l = _downsample(_luminance(ref_rgba[box], ref_cov[box]), ssim_downsample)
-        test_l = _downsample(_luminance(test_rgba[box], test_cov[box]), ssim_downsample)
-        weight = _downsample(union[box].astype(np.float64), ssim_downsample)
+        ref_l = _downsample(_luminance(ref_rgba[box], coloured[box]), ssim_downsample)
+        test_l = _downsample(_luminance(test_rgba[box], coloured[box]), ssim_downsample)
+        weight = _downsample(coloured[box].astype(np.float64), ssim_downsample)
         structural = ssim(ref_l, test_l, weight)
     return RegionMetrics(n_ref, n_test, n_both, iou, delta_e, delta_e_p95, structural)
 
@@ -251,42 +279,90 @@ class Calibration:
     rule: str
     distributions: dict = field(default_factory=dict)
     fences: dict = field(default_factory=dict)
+    geometry_samples: int | None = None
 
     def to_json(self) -> dict:
-        return {"thresholds": self.thresholds.to_json(), "samples": self.samples, "rule": self.rule,
-                "fences": self.fences, "distributions": self.distributions}
+        return {"thresholds": self.thresholds.to_json(), "samples": self.samples,
+                "geometrySamples": self.samples if self.geometry_samples is None else self.geometry_samples,
+                "rule": self.rule, "fences": self.fences, "distributions": self.distributions}
 
 
 IOU_EDGES = [0, 0.5, 0.7, 0.8, 0.85, 0.9, 0.925, 0.95, 0.97, 0.98, 0.99, 1.0]
 DELTA_E_EDGES = [0, 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10, 15, 20, 30, 50, 100]
 SSIM_EDGES = [-1, 0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0]
+IDEAL = {"iou": 1.0, "delta_e": 0.0, "ssim": 1.0}  # exact agreement
+MIN_INEXACT = 8  # fewer inexact samples than this: the threshold is exact agreement
 
 
-def calibrate(samples: Sequence[RegionMetrics], *, fence: float = 3.0, min_pixels: int = 16) -> Calibration:
-    """Thresholds from Tukey's fences over a sample distribution, e.g. every vanilla face with the default pack.
+def _worst_per_group(values: list[float], groups: Sequence[str], name: str) -> np.ndarray:
+    """One value per group: its worst inexact value (groups whose values are all exact or NaN give none)."""
+    worst: dict[str, float] = {}
+    pick = max if name == "delta_e" else min
+    for value, group in zip(values, groups):
+        if value is None or not math.isfinite(value) or value == IDEAL[name]:
+            continue
+        worst[group] = pick(worst[group], value) if group in worst else value
+    return np.asarray(list(worst.values()), dtype=np.float64)
 
-    ``iou_min = Q1 - fence * IQR`` and ``ssim_min`` likewise (clipped to their range), ``delta_e_max = Q3 + fence *
-    IQR``. With ``fence = 3`` (Tukey's "far out") a region fails only when it is an outlier against the bulk of the
-    samples, whatever produced the bulk's residual error (rasterisation edges, sampling, shading).
+
+def calibrate(samples: Sequence[RegionMetrics], *, geometry_samples: Sequence[RegionMetrics] | None = None,
+              groups: Sequence[str] | None = None, fence: float = 3.0, min_pixels: int = 16) -> Calibration:
+    """Thresholds from Tukey's far-out fences over the inexact samples of a calibration distribution.
+
+    ``delta_e`` and ``ssim`` come from ``samples``, ``iou`` from ``geometry_samples`` (default ``samples``): IoU
+    measures geometry, so it may be calibrated on a wider set of states whose geometry is known to be the same.
+
+    Exact agreements (IoU 1, ΔE 0, SSIM 1) are left out of the quartiles. When BlueMap and the client draw the same
+    thing, most regions agree exactly; with more than half the samples at one value the IQR is 0 and the fence would
+    collapse to exact equality, so the spread is taken from the samples that do differ: ``iou_min = Q1 - fence *
+    IQR`` and ``ssim_min`` likewise (clipped to their range), ``delta_e_max = Q3 + fence * IQR``. With ``fence = 3``
+    (Tukey's "far out") a region fails only when it is an outlier against the residual error of matching renderings
+    (rasterisation edges, cut-out and translucent texels, shading). Fewer than ``MIN_INEXACT`` inexact samples: the
+    threshold is exact agreement.
+
+    ``groups`` (parallel to ``samples``, e.g. the block of each region): ``delta_e`` and ``ssim`` then take one
+    sample per group, its worst inexact region. Colour and texture residuals come from a block's model and
+    textures, which all its metas and faces share; per region, a few blocks with many exact-but-for-rounding faces
+    would make the fence so tight that the residual of cut-out or translucent blocks fails, per group every block
+    counts once.
     """
     judged = [m for m in samples if m.union_pixels >= min_pixels]
-    columns = {"iou": [m.iou for m in judged], "delta_e": [m.delta_e for m in judged], "ssim": [m.ssim for m in judged]}
-    fences = {}
+    judged_groups = None if groups is None else [g for m, g in zip(samples, groups) if m.union_pixels >= min_pixels]
+    geometry = judged if geometry_samples is None else [m for m in geometry_samples if m.union_pixels >= min_pixels]
+    columns = {"iou": [m.iou for m in geometry], "delta_e": [m.delta_e for m in judged],
+               "ssim": [m.ssim for m in judged]}
+    fences: dict[str, dict] = {}
+    limits: dict[str, float] = {}
     for name, values in columns.items():
         v = finite(values)
         if not v.size:
             raise ValueError(f"no finite {name} values to calibrate on")
-        q1, q3 = (float(x) for x in np.percentile(v, [25, 75]))
-        fences[name] = {"q1": q1, "q3": q3, "iqr": q3 - q1}
-    iou_min = max(0.0, fences["iou"]["q1"] - fence * fences["iou"]["iqr"])
-    ssim_min = max(-1.0, fences["ssim"]["q1"] - fence * fences["ssim"]["iqr"])
-    delta_e_max = fences["delta_e"]["q3"] + fence * fences["delta_e"]["iqr"]
-    thresholds = Thresholds(round(iou_min, 4), round(delta_e_max, 3), round(ssim_min, 4), min_pixels)
-    rule = (f"Tukey fences with k = {fence} over {len(judged)} regions with at least {min_pixels} covered pixels: "
-            f"iou_min = Q1 - k*IQR, ssim_min = Q1 - k*IQR, delta_e_max = Q3 + k*IQR")
-    distributions = {
-        "iou": {"summary": summarize(columns["iou"]), "histogram": histogram(columns["iou"], IOU_EDGES)},
-        "delta_e": {"summary": summarize(columns["delta_e"]), "histogram": histogram(columns["delta_e"], DELTA_E_EDGES)},
-        "ssim": {"summary": summarize(columns["ssim"]), "histogram": histogram(columns["ssim"], SSIM_EDGES)},
-    }
-    return Calibration(thresholds, len(judged), rule, distributions, fences)
+        if judged_groups is not None and name != "iou":
+            inexact = _worst_per_group(values, judged_groups, name)
+            fences[name] = {"unit": "group", "groups": len(set(judged_groups)), "inexact": int(inexact.size)}
+        else:
+            inexact = v[v != IDEAL[name]]
+            fences[name] = {"unit": "region", "exact": int(v.size - inexact.size), "inexact": int(inexact.size)}
+        if inexact.size < MIN_INEXACT:
+            limits[name] = IDEAL[name]
+            continue
+        q1, q3 = (float(x) for x in np.percentile(inexact, [25, 75]))
+        fences[name].update(q1=q1, q3=q3, iqr=q3 - q1)
+        if fences[name]["unit"] == "group":
+            fences[name]["values"] = sorted(round(float(x), 4) for x in inexact)
+        limits[name] = q3 + fence * (q3 - q1) if name == "delta_e" else q1 - fence * (q3 - q1)
+    thresholds = Thresholds(round(max(0.0, limits["iou"]), 4), round(limits["delta_e"], 3),
+                            round(max(-1.0, limits["ssim"]), 4), min_pixels)
+    unit = "regions" if groups is None else "groups (each group's worst inexact region)"
+    rule = (f"Tukey far-out fences, k = {fence}, over the inexact samples (IoU < 1, delta E > 0, SSIM < 1) of "
+            f"{len(judged)} regions with at least {min_pixels} covered pixels: iou_min = Q1 - k*IQR over "
+            f"{len(geometry)} geometry regions, delta_e_max = Q3 + k*IQR and ssim_min = Q1 - k*IQR over {unit}; "
+            f"exact agreements are left out because they are most samples and collapse the quartiles; fewer than "
+            f"{MIN_INEXACT} inexact samples: exact agreement")
+    edges = {"iou": IOU_EDGES, "delta_e": DELTA_E_EDGES, "ssim": SSIM_EDGES}
+    distributions = {}
+    for name, values in columns.items():
+        v = finite(values)
+        distributions[name] = {"summary": summarize(v), "inexact": summarize(v[v != IDEAL[name]]),
+                               "histogram": histogram(v, edges[name])}
+    return Calibration(thresholds, len(judged), rule, distributions, fences, len(geometry))

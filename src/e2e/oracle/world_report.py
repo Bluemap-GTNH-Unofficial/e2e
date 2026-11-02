@@ -123,7 +123,8 @@ def write(out: Path, report: dict, crops: int) -> None:
     labels_cache: dict = {}
     images_cache: dict = {}
     for face in failing[:crops]:
-        face["crop"] = crop(out, face, labels_cache, images_cache)
+        if (out / "report" / f"{face['view']}-labels.npz").is_file():  # a copied scene directory may lack report/
+            face["crop"] = crop(out, face, labels_cache, images_cache)
 
     s = report["summary"]
     t = report["thresholds"]
@@ -136,7 +137,10 @@ def write(out: Path, report: dict, crops: int) -> None:
              f"{', mods ' + e(', '.join(report['client']['extra_mods'])) if report['client']['extra_mods'] else ''}). "
              f"Test: the BlueMap webapp with packs <code>{e(', '.join(Path(p).name for p in report['bluemap_packs']))}</code>, "
              f"camera pinned to the client's matrices.</p>",
-             f"<p><b>{s['passed']} / {s['judged']} judged faces pass ({_rate(s['passed'], s['judged'])})</b> in "
+             f"<p><b>{s['passed']} / {s['judged']} judged faces pass ({_rate(s['passed'], s['judged'])})</b>, "
+             f"<b>{s.get('accepted', 0)} faces accepted (1.13)</b> ({s.get('accepted_states', 0)} vanilla states "
+             f"<code>oracle/accepted.yaml</code> names, where the 1.7.10 vs 1.13 data backs the reason; neither passes "
+             f"nor failures: {e(', '.join((report.get('accepted') or {}).get('states', [])))}) in "
              f"{s['views_aligned']} / {s['views']} aligned views; {s['faces']} faces shown, faces in views that failed "
              f"the alignment check are not judged. Thresholds: IoU &ge; {t['iou_min']}, mean CIEDE2000 &le; "
              f"{t['delta_e_max']}, SSIM &ge; {t['ssim_min']}, faces with fewer than {t['min_pixels']} pixels are not judged.</p>"]
@@ -147,8 +151,12 @@ def write(out: Path, report: dict, crops: int) -> None:
                      f"<code>{e(', '.join(excluded['states']))}</code>.</p>")
     calibration = report.get("calibration") or {}
     if calibration:
+        ff = calibration.get("falseFailures") or {}
         parts.append(f"<p>Calibration: {e(calibration.get('rule', ''))} ({e(str(calibration.get('scene')))}, "
-                     f"{e(str(calibration.get('variant')))}, <code>{e(str(calibration.get('namespace')))}</code> faces).</p>")
+                     f"{e(str(calibration.get('variant')))}; {e(str(calibration.get('unit', '')))}; states that look "
+                     f"the same in 1.7.10 and 1.13 from <code>{e(str(calibration.get('classification')))}</code>). "
+                     + "; ".join(f"False failures, {e(k)} set: {v['states_fail']} / {v['states']} states, "
+                                 f"{v['faces_fail']} / {v['faces']} faces" for k, v in ff.items()) + "</p>")
         dists = calibration.get("distributions", {})
         rows = "".join(
             f"<tr><td class=l>{e(k)}</td>" + "".join(f"<td>{_fmt(v['summary'].get(q))}</td>"
@@ -186,10 +194,11 @@ def write(out: Path, report: dict, crops: int) -> None:
                      f"<a href='bluemap/{n}.png'><img src='bluemap/{n}.png'></a>"
                      f"<a href='report/{n}-diff.png'><img src='report/{n}-diff.png'></a>"
                      f"<a href='report/{n}-labels.png'><img src='report/{n}-labels.png'></a></p>")
-    parts.append("</div><h2>Per mod</h2><table><tr><th class=l>mod</th><th>judged</th><th>passed</th><th>pass rate</th></tr>")
+    parts.append("</div><h2>Per mod</h2><table><tr><th class=l>mod</th><th>judged</th><th>passed</th><th>pass rate</th>"
+                 "<th>accepted (1.13)</th></tr>")
     for mod, m in s["per_mod"].items():
         parts.append(f"<tr><td class=l>{e(mod)}</td><td>{m['judged']}</td><td>{m['passed']}</td>"
-                     f"<td>{_rate(m['passed'], m['judged'])}</td></tr>")
+                     f"<td>{_rate(m['passed'], m['judged'])}</td><td>{m.get('accepted', 0)}</td></tr>")
     parts.append("</table><h2>Worst faces, by mod</h2><p>Crops: client | BlueMap | difference; yellow and cyan outline "
                  "the face region in each rendering.</p>")
     by_mod: dict[str, list[dict]] = {}

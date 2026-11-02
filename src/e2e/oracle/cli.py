@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from e2e.oracle import states, world
+from e2e.oracle import states, world, world_swap
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -13,3 +13,4 @@ def register(sub: argparse._SubParsersAction) -> None:
     oracle_sub = oracle.add_subparsers(dest="oracle_command", required=True)
     states.add_parser(oracle_sub)
     world.add_parser(oracle_sub)
+    world_swap.add_parser(oracle_sub)

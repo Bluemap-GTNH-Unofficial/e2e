@@ -7,9 +7,10 @@ Per camera, in a fresh headless Chromium context of the client image size:
 2. Once the map is loaded, the map controls are detached and the camera gets the client's eye position, orientation
    and projection matrix (``updateProjectionMatrix`` is replaced so BlueMap's far-plane juggling cannot change it).
 3. Capture conditions as on the client: ``ambientLight`` and ``sunlightStrength`` 1 (full brightness), no ambient
-   occlusion and Minecraft's flat face shade (up 1.0, down 0.5, north/south 0.8, west/east 0.6; diagonal faces
-   unshaded) instead of BlueMap's directional light, no mipmaps (nearest texel sampling like the client with
-   ``mipmapLevels:0``), animations pinned to their first frame, no chunk borders.
+   occlusion and Minecraft's flat face shade (up 1.0, down 0.5, north/south 0.8, west/east 0.6; vertical diagonal
+   faces such as cross plants unshaded, which takes a tolerance of 0.02 on the normal components: BlueMap's normals of
+   a 45 degree rotated element are not exactly diagonal) instead of BlueMap's directional light, no mipmaps (nearest
+   texel sampling like the client with ``mipmapLevels:0``), animations pinned to their first frame, no chunk borders.
 4. Hires tiles are loaded around the given centre (dropping every earlier tile) and the frame is drawn until two
    consecutive frames are identical. A second pass draws the same camera with the hires materials writing their
    view-space depth instead of their colour (24 bit fixed point, 1/16384 block resolution, alpha 0 where nothing is
@@ -72,7 +73,7 @@ PIN_CAMERA_JS = """
         if (start < 0 || last < 0 || end < 0) throw new Error("BlueMap hires vertex shader changed: directional lighting block not found");
         vs = vs.slice(0, start) +
             "// oracle: Minecraft's flat-lighting face shade (no ambient occlusion)\\n" +
-            "    if (vNormal.y != 0.0 || abs(abs(vNormal.x) - abs(vNormal.z)) != 0.0) {\\n" +
+            "    if (abs(vNormal.y) > 0.02 || abs(abs(vNormal.x) - abs(vNormal.z)) > 0.02) {\\n" +
             "        vAo = min(vNormal.x * vNormal.x * 0.6 + vNormal.y * vNormal.y * ((3.0 + vNormal.y) / 4.0) + vNormal.z * vNormal.z * 0.8, 1.0);\\n" +
             "    }" + vs.slice(end + 1);
         vs = replace(vs, "gl_Position = projectionMatrix", "vOracleViewDepth = -(viewMatrix * modelMatrix * vec4(position, 1)).z;\\n    gl_Position = projectionMatrix", "hires vertex");
@@ -115,10 +116,13 @@ PIN_CAMERA_JS = """
     };
     camera.updateProjectionMatrix();
 
-    // a fresh tile set around the compared area
+    // a fresh tile set around the compared area; one tile more than asked for, because the webapp's spiral loader
+    // (TileManager.loadNextTile) stops one ring short on one side of each axis and would leave out tiles within
+    // hiresDistance (seen with the camera outside the area: the tile under the camera was never loaded)
     manager.position.set(center[0], center[1], center[2]);
     for (const tiles of [map.hiresTileManager, ...map.lowresTileManager]) tiles.removeAllTiles();
-    viewer.loadMapArea(center[0], center[2], hiresDistance, lowresDistance);
+    const hiresTile = Math.max(map.data.hires.tileSize.x, map.data.hires.tileSize.z);
+    viewer.loadMapArea(center[0], center[2], hiresDistance + hiresTile, lowresDistance);
     viewer.redraw();
 }
 """

@@ -270,13 +270,63 @@ def _not_occluded(index: np.ndarray, key: int, own: Labels, other: Labels) -> np
     return index[(other_key == key) | ~nearer]
 
 
+def cell_keys(cells: np.ndarray) -> np.ndarray:
+    """Keys of whole cells (face bits 0) of ``cells`` (..., 3): the cell part of [encode]."""
+    return encode(cells, np.zeros(cells.shape[:-1], dtype=np.int64))
+
+
+def decode_cells(keys: np.ndarray) -> np.ndarray:
+    """The cells (n, 3) of face or cell keys, vectorised [decode]."""
+    keys = np.asarray(keys, dtype=np.int64)
+    return np.stack([(keys >> 37) - _XZ_OFFSET, ((keys >> 3) & ((1 << 13) - 1)) - _Y_OFFSET,
+                     ((keys >> 16) & ((1 << 21) - 1)) - _XZ_OFFSET], axis=-1)
+
+
+BEHIND_STEPS = 64  # cells a view ray is followed beyond a translucent surface
+
+
+def behind(labels: Labels, world: np.ndarray, eye: np.ndarray, pixels: np.ndarray, cells: np.ndarray,
+           see_through: np.ndarray, steps: int = BEHIND_STEPS) -> np.ndarray:
+    """What a view ray shows through a translucent surface: for each labelled pixel of ``pixels`` (H, W bool), the
+    cell key ([cell_keys]) of the first cell beyond the pixel's own cell along the ray that is in ``cells`` and not in
+    ``see_through`` (cell keys; translucent cells in a row, such as a glass wall, are looked through), -1 when there is
+    none within ``steps`` cells. ``world`` (H, W, 3) are the labelled hit points, ``eye`` the camera position."""
+    out = np.full(labels.key.shape, -1, dtype=np.int64)
+    index = np.flatnonzero(pixels & (labels.key >= 0))
+    if not index.size:
+        return out
+    point = world.reshape(-1, 3)[index]
+    ray = point - eye
+    ray /= np.linalg.norm(ray, axis=-1, keepdims=True)
+    cell = decode_cells(labels.key.reshape(-1)[index])
+    step = np.sign(ray).astype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):  # Amanatides-Woo grid traversal
+        t_next = np.maximum(np.where(ray != 0, (cell + (step > 0) - point) / ray, np.inf), 0.0)
+        t_delta = np.where(ray != 0, 1.0 / np.abs(ray), np.inf)
+    found = np.full(index.size, -1, dtype=np.int64)
+    pending = np.arange(index.size)
+    for _ in range(steps):
+        axis = np.argmin(t_next[pending], axis=-1)
+        cell[pending, axis] += step[pending, axis]
+        t_next[pending, axis] += t_delta[pending, axis]
+        key = cell_keys(cell[pending])
+        hit = np.isin(key, cells) & ~np.isin(key, see_through)
+        found[pending[hit]] = key[hit]
+        pending = pending[~hit]
+        if not pending.size:
+            break
+    out.reshape(-1)[index] = found
+    return out
+
+
 def compare_faces(reference_rgba: np.ndarray, test_rgba: np.ndarray, reference: Labels, test: Labels,
-                  keys: np.ndarray) -> list[FaceResult]:
+                  keys: np.ndarray, colour_excluded: np.ndarray | None = None) -> list[FaceResult]:
     """Metrics of every face in ``keys`` that either rendering shows, computed on the bounding box of the union of
     both regions. The reference region is where the client shows the face, the test region where BlueMap does; a
     region's pixels where the *other* rendering shows a nearer surface of something else are left out (occluded
     there: that difference is the occluder's), so a face is judged on its own surface only. A face only one rendering
-    shows has an empty region in the other (IoU 0)."""
+    shows has an empty region in the other (IoU 0). ``colour_excluded`` (H, W) pixels count for the coverage but not
+    for the colour metrics ([metrics.compare_region])."""
     w = reference.key.shape[1]
     ref_groups = group(np.where(np.isin(reference.key, keys), reference.key, -1))
     test_groups = group(np.where(np.isin(test.key, keys), test.key, -1))
@@ -295,7 +345,8 @@ def compare_faces(reference_rgba: np.ndarray, test_rgba: np.ndarray, reference: 
         test_region = np.zeros_like(ref_region)
         ref_region[ref_index // w - y0, ref_index % w - x0] = True
         test_region[test_index // w - y0, test_index % w - x0] = True
-        m = metrics.compare_region(reference_rgba[box], test_rgba[box], ref_region, test_region)
+        m = metrics.compare_region(reference_rgba[box], test_rgba[box], ref_region, test_region,
+                                   colour_excluded=None if colour_excluded is None else colour_excluded[box])
         source, labels = (ref_index, reference) if ref_index.size else (test_index, test)
         residual = labels.residual.reshape(-1)[source]
         x, y, z, face = decode(key)

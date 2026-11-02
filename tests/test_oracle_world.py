@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from e2e import scenes
-from e2e.oracle import camera, faces, webapp
+from e2e.oracle import accepted, camera, faces, metrics, webapp, world
 
 W, H = 160, 90
 FAR = 384.0
@@ -173,6 +173,49 @@ def test_compare_faces_of_identical_renderings():
     assert all(r.metrics.iou == 0.0 and r.metrics.test_pixels == 0 for r in missing)
 
 
+def _cube_distances(eye: np.ndarray, rays: np.ndarray, cubes: list) -> np.ndarray:
+    """(len(cubes), H, W) distance along each ray to each cube (inf = miss)."""
+    return np.stack([_raycast(eye, rays, [c]) for c in cubes])
+
+
+@pytest.mark.parametrize("see_through", [[(0, 5, 0)], [(0, 5, 0), (1, 4, 1)]])
+def test_behind_finds_the_first_opaque_cell_beyond_a_translucent_one(see_through):
+    client, points, hit = _scene()
+    labels = faces.label(points, hit, client.eye)
+    own = np.where(labels.key >= 0, labels.key & ~np.int64(7), -1)
+    translucent_keys = faces.cell_keys(np.asarray(see_through))
+    pixels = np.isin(own, translucent_keys)
+    found = faces.behind(labels, points, client.eye, pixels, faces.cell_keys(np.asarray(CUBES)), translucent_keys)
+    # brute force: the nearest cube along the ray that is not translucent and lies beyond the visible surface
+    opaque = [c for c in CUBES if c not in see_through]
+    t = _cube_distances(client.eye, _rays(client), opaque)
+    t_hit = np.linalg.norm(points - client.eye, axis=-1)
+    t = np.where(t > t_hit + 1e-6, t, np.inf)
+    nearest = np.argmin(t, axis=0)
+    expected = np.where(np.isfinite(t.min(axis=0)), faces.cell_keys(np.asarray(opaque))[nearest], -1)
+    assert pixels.sum() > 100
+    assert (found[pixels] == expected[pixels]).mean() > 0.98
+    # (1, 4, 1) is behind part of (0, 5, 0); looked through as well, nothing is behind
+    assert (found[pixels] >= 0).any() == ((1, 4, 1) not in see_through) and (found[pixels] < 0).any()
+    assert (found[~pixels] == -1).all()
+
+
+def test_colour_excluded_pixels_count_for_coverage_only():
+    ref = np.zeros((32, 32, 4), dtype=np.uint8)
+    ref[..., 3] = 255
+    test = ref.copy()
+    test[:, :16, :3] = 200  # the left half differs in colour
+    region = np.ones((32, 32), bool)
+    plain = metrics.compare_region(ref, test, region)
+    excluded = np.zeros((32, 32), bool)
+    excluded[:, :16] = True
+    m = metrics.compare_region(ref, test, region, colour_excluded=excluded)
+    assert plain.delta_e > 10 and m.delta_e == 0.0 and m.ssim == pytest.approx(1.0)
+    assert m.iou == plain.iou == 1.0 and m.both_pixels == plain.both_pixels == 32 * 32
+    everything = metrics.compare_region(ref, test, region, colour_excluded=np.ones((32, 32), bool))
+    assert math.isnan(everything.delta_e) and math.isnan(everything.ssim) and everything.iou == 1.0
+
+
 def test_depth_pass_decoding_matches_the_shader_packing():
     depth = np.array([0.0, 0.5, 3.14159, 17.000061, 250.25, 1023.99])
     i = np.floor(depth)
@@ -199,3 +242,26 @@ def test_webapp_camera_reproduces_the_client_view():
     assert np.allclose(np.linalg.inv(world), client.view, atol=1e-9)
     assert np.allclose(np.asarray(cam["projection"]).reshape(4, 4).T, client.projection)
     assert cam["fov"] == pytest.approx(70.0) and cam["aspect"] == pytest.approx(W / H)
+
+
+def _face(block: str, meta: int, iou: float) -> dict:
+    return {"view": "v", "block": block, "meta": meta, "label": f"{block}:{meta}", "mod": block.split(":")[0],
+            "ref_pixels": 100, "test_pixels": 100, "both_pixels": round(100 * iou), "iou": iou, "delta_e": 0.5,
+            "delta_e_p95": 1.0, "ssim": 0.99, "magenta": 0.0, "face": "up"}
+
+
+def test_judge_reports_accepted_faces_apart(tmp_path):
+    file = tmp_path / "accepted.yaml"
+    file.write_text("reasons: {random_variant: r}\naccepted:\n  - {states: 'minecraft:stone[meta=0]', reason: random_variant}\n")
+    states = {"minecraft:stone[meta=0]": {"name": "minecraft:stone", "meta": 0, "textures": {}, "randomOffset": False,
+                                          "randomVariant": True, "flatteningDrop": False}}
+    accepted_list = accepted.load({"states": states}, set(), file)
+    view = world.ViewOutcome("v", "perspective", [_face("minecraft:stone", 0, 0.5), _face("mod:x", 0, 1.0),
+                                                  _face("mod:y", 0, 0.5)], {"passed": True})
+    world.judge([view], metrics.Thresholds(0.9, 2.0, 0.9, 64), accepted_list)
+    stone, good, bad = view.faces
+    assert stone["accepted"].startswith("accepted (1.13)") and stone["failed"] == [] and stone["accepted_checks"]
+    assert good["passed"] and not bad["passed"] and bad["failed"]
+    s = world.summarize([view])
+    assert (s["judged"], s["passed"], s["accepted"]) == (2, 1, 1)
+    assert s["per_mod"]["minecraft"]["accepted"] == 1 and s["per_mod"]["minecraft"]["pass_rate"] is None

@@ -60,7 +60,7 @@ def _write_diffs(out: Path, results: list[dict], diff_image: Callable[[np.ndarra
 
 def _state_block(r: dict, images: bool) -> str:
     status = r["status"]
-    cls = "ok" if status == "pass" else "bad"
+    cls = "ok" if status in ("pass", "accepted") else "bad"
     bm = r.get("bluemap", {})
     variants = ", ".join(f"{v.get('renderer', '?')} {v.get('model', '')}" for v in bm.get("variants", []) or [])
     client = r.get("client", {})
@@ -76,11 +76,17 @@ def _state_block(r: dict, images: bool) -> str:
         facts.append(f"BlueMap error: {html.escape(bm['error'])}")
     if r.get("note"):
         facts.append(html.escape(r["note"]))
+    if r.get("accepted"):
+        facts.append(html.escape(r["accepted"]))
+    if r.get("acceptedUnbacked"):
+        facts.append(f"accepted.yaml names it ({html.escape(r['acceptedUnbacked'])}) but the 1.7.10 vs 1.13 data does "
+                     f"not show that difference: judged")
     overall = []
     for name, v in (r.get("views") or {}).items():
         m = v["overall"]
         overall.append(f"{name}: IoU {_fmt(m['iou'])}, &Delta;E {_fmt(m['delta_e'], 2)}, SSIM {_fmt(m['ssim'])}")
-    parts = [f'<div class="state"><b class="{cls}">{html.escape(status)}</b> <code>{html.escape(r["key"])}</code> '
+    shown = "accepted (1.13)" if status == "accepted" else status
+    parts = [f'<div class="state"><b class="{cls}">{html.escape(shown)}</b> <code>{html.escape(r["key"])}</code> '
              f'score {_fmt(r.get("score"))}<br>{"; ".join(facts)}<br>{" | ".join(overall)}']
     if r.get("cause"):
         parts.append(f"<br>suspected: <i>{html.escape(r['cause'])}</i>")
@@ -113,9 +119,23 @@ def _calibration(report: dict) -> str:
     if not file.is_file():
         return "<p>No calibration file.</p>"
     cal = json.loads(file.read_text(encoding="utf-8"))
-    parts = [f"<p>From <code>{html.escape(str(file))}</code> ({cal['states']} vanilla states of variant "
-             f"{html.escape(cal['variant'])}, {html.escape(cal['created'])}). Excluded: "
-             f"{html.escape(', '.join(cal['excluded']))} (not in 1.7.10).</p>"]
+    parts = [f"<p>From <code>{html.escape(str(file))}</code>, {html.escape(cal['created'])}: vanilla states of variant "
+             f"{html.escape(cal['variant'])} that look the same in 1.7.10 and 1.13 (<code>{html.escape(str(cal.get('classification')))}</code>): "
+             f"delta E and SSIM over {cal['states']} states, one sample per block (identical textures, no random "
+             f"offset or variant, not rotated, no custom UV or shade:false element, consistent state mapping, same "
+             f"geometry, drawn by 1.7.10's box or crossed-squares renderers), IoU over the regions of "
+             f"{cal.get('geometryStates', cal['states'])} states (the same without the renderer condition). States "
+             f"accepted.yaml names and {html.escape(', '.join(cal['excluded']))} (not in 1.7.10) are left out.</p>"]
+    ff = cal.get("falseFailures") or {}
+    if ff:
+        parts.append("<p>False failures on the calibration sets (states that look the same in both versions): "
+                     + "; ".join(f"{html.escape(k)} {v['fail']} / {v['states']} ({_rate(v['rate'])})" for k, v in ff.items())
+                     + "</p>")
+        failing = (ff.get("geometry") or {}).get("failing", [])
+        if failing:
+            parts.append("<details><summary>failing calibration states</summary>" + "".join(
+                f"<div><code>{html.escape(f['key'])}</code> {html.escape('; '.join(f['checks']))}</div>" for f in failing)
+                + "</details>")
     for level in ("view", "face"):
         c = cal[level]
         t = c["thresholds"]
@@ -127,9 +147,10 @@ def _calibration(report: dict) -> str:
             f = c["fences"][metric]
             rows.append(f"<tr><td class=l>{metric}</td>" + "".join(
                 f"<td>{_fmt(s.get(k))}</td>" for k in ("count", "mean", "p01", "p05", "p25", "p50", "p75", "p95", "p99", "max"))
-                + f"<td>{_fmt(f['iqr'])}</td></tr>")
+                + f"<td>{f.get('inexact', '-')}</td><td>{_fmt(f.get('q1'))}</td><td>{_fmt(f.get('q3'))}</td></tr>")
         parts.append("<table><tr><th class=l>metric</th><th>n</th><th>mean</th><th>p1</th><th>p5</th><th>p25</th>"
-                     "<th>p50</th><th>p75</th><th>p95</th><th>p99</th><th>max</th><th>IQR</th></tr>" + "".join(rows) + "</table>")
+                     "<th>p50</th><th>p75</th><th>p95</th><th>p99</th><th>max</th><th>inexact</th><th>Q1 inexact</th>"
+                     "<th>Q3 inexact</th></tr>" + "".join(rows) + "</table>")
         parts.append("<div style='display:flex;gap:2em'>" + "".join(
             _histogram(f"{level} {metric}", c["distributions"][metric]["histogram"]) for metric in ("iou", "delta_e", "ssim"))
             + "</div>")
@@ -165,18 +186,22 @@ def write(out: Path, report: dict, results: list[dict], diff_image: Callable[[np
         f"Runtime: client render {_fmt(sec.get('client'), 0)} s, BlueMap render {_fmt(sec.get('bluemapRender'), 0)} s"
         f" (with Gradle {_fmt(sec.get('bluemap'), 0)} s), comparison {_fmt(sec.get('compare'), 0)} s.</p>",
         f"<p>Conditions: {html.escape(str(report.get('conditions')))}</p>",
-        f"<h2>Result: {t['pass']} / {t['judged']} judged states pass ({_rate(t['passRate'])})</h2>",
-        f"<p>{t['states']} states; not judged: {t['clientBlank']} drawn only by BlueMap while the client draws nothing "
-        f"in isolation, {t['clientError']} with a client render error, {t['bluemapMissing']} without BlueMap output."
+        f"<h2>Result: {t['pass']} / {t['judged']} judged states pass ({_rate(t['passRate'])}), "
+        f"{t.get('accepted', 0)} accepted (1.13)</h2>",
+        f"<p>{t['states']} states; accepted (1.13): {t.get('accepted', 0)} vanilla states "
+        f"<code>{html.escape(str((report.get('accepted') or {}).get('file')))}</code> names and the 1.7.10 vs 1.13 data "
+        f"backs (not passes, not failures); not judged: {t['clientBlank']} drawn only by BlueMap while the client draws "
+        f"nothing in isolation, {t['clientError']} with a client render error, {t['bluemapMissing']} without BlueMap output."
         + (" Thresholds are provisional (subset run before a calibration)." if report.get("provisionalThresholds") else "")
         + "</p>",
         "<h2>Per mod</h2><table><tr><th class=l>mod</th><th>states</th><th>judged</th><th>pass</th><th>fail</th>"
-        "<th>pass rate</th><th>client blank</th><th>client error</th><th>no BlueMap</th></tr>",
+        "<th>pass rate</th><th>accepted (1.13)</th><th>client blank</th><th>client error</th><th>no BlueMap</th></tr>",
     ]
     for mod, c in report["mods"].items():
         body.append(f"<tr><td class=l><a href='#mod-{html.escape(mod)}'>{html.escape(mod)}</a></td><td>{c['states']}</td>"
                     f"<td>{c['judged']}</td><td>{c['pass']}</td><td>{c['fail']}</td><td>{_rate(c['passRate'])}</td>"
-                    f"<td>{c['clientBlank']}</td><td>{c['clientError']}</td><td>{c['bluemapMissing']}</td></tr>")
+                    f"<td>{c.get('accepted', 0)}</td><td>{c['clientBlank']}</td><td>{c['clientError']}</td>"
+                    f"<td>{c['bluemapMissing']}</td></tr>")
     body.append("</table><h2>Suspected causes of failures (heuristic)</h2><table><tr><th class=l>cause</th><th>states</th></tr>")
     body += [f"<tr><td class=l>{html.escape(k or '(none)')}</td><td>{v}</td></tr>" for k, v in report["causes"].items()]
     body.append("</table><h2>Thresholds and calibration</h2>")
@@ -194,7 +219,8 @@ def write(out: Path, report: dict, results: list[dict], diff_image: Callable[[np
         if len(rs) > PER_MOD_ROWS:
             body.append(f"<p>... {len(rs) - PER_MOD_ROWS} more in report.json</p>")
         body.append("</details>")
-    for status, title in (("client_blank", "Not judged: the client draws nothing in isolation"),
+    for status, title in (("accepted", "Accepted (1.13): differences of the 1.13 assets BlueMap keeps on purpose"),
+                          ("client_blank", "Not judged: the client draws nothing in isolation"),
                           ("client_error", "Not judged: client render errors"),
                           ("bluemap_missing", "No BlueMap output")):
         rs = [r for r in results if r["status"] == status]

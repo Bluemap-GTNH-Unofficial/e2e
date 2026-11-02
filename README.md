@@ -162,24 +162,73 @@ cd ../../e2e && uv run e2e oracle states --variant default                # Blue
 5. **Face IDs** per pixel (palette PNGs `*.faces.png`): 1 down, 2 up, 3 north, 4 south, 5 west, 6 east (normal
    component at least 0.95), 7 other. Client: plane normals from its depth buffer; BlueMap: the triangle normals.
 6. **Comparison** (`oracle/metrics.py`, per view): the whole view with the `view` thresholds and each axis face
-   (pixels each side attributes to that face) with the `face` thresholds: alpha-coverage IoU, mean CIEDE2000 over
-   pixels both draw, luminance SSIM (7 x 7 window, 2x downsampled). Regions under 32 covered pixels are not judged.
+   (pixels each side attributes to that face) with the `face` thresholds: alpha-coverage IoU with a 1 px boundary
+   tolerance (a covered pixel matches when the other coverage has one within 1 px, so the one-pixel edge
+   differences of the two rasterisers do not count), mean CIEDE2000 over pixels both draw, luminance SSIM (7 x 7
+   window, 2x downsampled) on the pixels both draw (coverage differences are the IoU's). Regions under 32 covered
+   pixels are not judged.
    A state passes when both views and all their faces pass. Not judged (listed separately): states the client
    draws nothing for in isolation while BlueMap draws something (upper halves, markings without support, ...), and
    states whose client render threw.
-7. **Calibration**: the first full run of variant `default` writes `out/oracle/default/states/calibration.json`;
-   every other run reads it (`--recalibrate` rewrites it). Thresholds are Tukey's far-out fences (k = 3,
-   `metrics.calibrate`) over the vanilla states both sides draw, excluding stone 1..6, dirt 1 and sponge 1 (1.8
-   states the 1.7.10 client draws as their base state); `iou_min`/`ssim_min` = Q1 - 3 IQR, `delta_e_max` = Q3 + 3
-   IQR. They are not tuned by hand; `report.html` shows the distributions.
-8. **Report**: `report.json` (totals and pass rates per mod, thresholds, causes, the 100 worst states and the worst
-   state of the 100 worst blocks, every state's status, score and failed checks) and `report.html` (the same with
-   client | BlueMap | difference images, failing states per mod).
+7. **Calibration**: the full runs of variant `default` classify every vanilla state against 1.7.10
+   (`src/e2e/oracle/vanilla.py`, written to `out/oracle/default/states/vanilla.json`; other variants and the world
+   oracle read it) and the first one (or `--recalibrate`) writes `out/oracle/default/states/calibration.json`.
+   BlueMap draws vanilla blocks from the 1.13 client jar, so the thresholds are calibrated only on vanilla states
+   that look the same in both versions, decided from data:
+   - **textures**: every texture of the 1.13 models BlueMap draws the state with is pixel-identical (frame 0) to the
+     1.7.10 texture it replaces, through the `copy` entries of `modernity/data/renames-1.7.10-to-1.13.json` and the
+     client jars (`downloads/mc/minecraft-client-1.7.10.jar`, BlueMap's `out/e2e/.cache/minecraft-client-1.13.jar`);
+     tinted faces also need identical grass/foliage colormaps;
+   - **no model difference**: no random offset (the fork's `blockProperties.json`), no random model or rotation in
+     the 1.13 blockstate (stone, grass, ...), no blockstate rotation at all (its textures turn with the model, with
+     or without `uvlock`), no unrotated element face whose `uv` is not the element-bounds UV or that has a texture
+     `rotation` (1.7.10's box renderer clips the texture to the bounds), no unrotated element with `shade: false`
+     (BlueMap ignores the flag, see below), no tile-entity renderer on the client, no BlueMap entity model, a state
+     1.7.10 has (not stone 1..6, dirt 1, sponge 1);
+   - **consistent state mapping**: within the block, the client draws two metas alike exactly when BlueMap draws
+     them with the same 1.13 model (farmland moisture 1-6 is wet in 1.7.10 but dry in 1.13, for example);
+   - **same geometry**: per view, the pixels whose face direction (from depth) or coverage differ, per pixel of the
+     client's face edges, no worse than for full cubes (1.13 model one 16^3 element, 1.7.10 render type 0; the
+     largest cube value within Tukey's far-out fence).
+
+   IoU is calibrated on these states (`geometry` set), delta E and SSIM on those of them 1.7.10 draws with its box
+   or crossed-squares renderers (render types 0, 1, 31, 39; `texture` set), whose texture mapping is the 1.13
+   cube/cross mapping; states `oracle/accepted.yaml` names are left out. Thresholds are Tukey's far-out fences
+   (k = 3, `metrics.calibrate`) over the **inexact** samples: most regions of identical renderings agree exactly
+   (IoU 1, delta E 0, SSIM 1), which makes the IQR 0, so the spread is taken from the samples that differ. IoU takes
+   every inexact region; delta E and SSIM take one sample per block, its worst inexact region (a block's metas and
+   faces share one model and texture set, so this weighs cut-out and translucent blocks like the rest instead of
+   letting many nearly exact faces of a few blocks set the fence). Fewer than 8 inexact samples: exact agreement.
+   `iou_min`/`ssim_min` = Q1 - 3 IQR, `delta_e_max` = Q3 + 3 IQR. They are not tuned by hand; `calibration.json`
+   and `report.html` carry the distributions, the sets and the calibration states the thresholds fail
+   (`falseFailures`).
+
+   BlueMap never reads a model element's `shade: false` (`Element.shade` is parsed but unused, the hires tile has no
+   flag, and the webapp's vertex shader lights every face by its normal), so crops, torches and other
+   `shade: false` elements are shaded in BlueMap but not in the client. The state rasteriser applies the face shade
+   by direction just as the webapp does, so the state oracle reproduces BlueMap's behaviour there.
+8. **Accepted 1.13 differences** (`oracle/accepted.yaml`, committed): vanilla state patterns with a reason
+   (`texture`, `random_offset`, `random_variant` (the stone rotation), `flattening_drop`). A named state is reported
+   as `accepted (1.13)`, neither pass nor failure, only where `vanilla.json` shows that reason for it in the
+   variant (a texture the variant's BlueMap packs replace, e.g. Modernity's, is not a 1.13 texture there);
+   otherwise it is judged and listed as unbacked. Keep the list minimal: only states that fail and whose failure
+   the data explains.
+9. **Report**: `report.json` (totals and pass rates per mod, thresholds, causes, the 100 worst states and the worst
+   state of the 100 worst blocks, every state's status, score and failed checks, `accepted`) and `report.html` (the
+   same with client | BlueMap | difference images, failing states per mod, accepted states).
+
+`uv run e2e oracle swap-test [--before <old calibration.json>]` measures how well the thresholds discriminate: the
+Modernity client's render of every state is the reference and the default client's render the test, for the
+states whose two renders differ (mean absolute RGBA difference at least 1); every one of them looks different, so
+the share flagged is the detection rate. It also reports each threshold set's failures on the calibration sets
+(states that look the same), and writes `out/oracle/default/states/swap-test.json`.
 
 The suspected causes in the report are heuristics from the metrics (silhouette, colour, brightness, texture
 pattern, BlueMap draws nothing or the missing model, tile-entity-only blocks); review the images before acting.
 Unit tests: `tests/test_oracle_metrics.py` (CIEDE2000 against published pairs, SSIM, regions, thresholds, Tukey
-fences) and `tests/test_oracle_states.py` (judging, calibration and report on synthetic renders).
+fences over inexact samples), `tests/test_oracle_states.py` (classification, judging, calibration, accepted states
+and report on synthetic renders and jars), `tests/test_oracle_accepted.py` (patterns, data backing) and
+`tests/test_oracle_vanilla.py` (UV, state-mapping and geometry-band rules, per-block calibration).
 
 ## World oracle (`oracle world`)
 
@@ -190,6 +239,8 @@ webapp's own shaders are checked against the game itself. Everything it writes g
 
 ```bash
 uv run e2e oracle world --variant default --scene vanilla-zoo [--scene ...] [--capture auto|always|never] [--mod-jar JAR] [--no-build]
+uv run e2e oracle world --variant default --rejudge --scene vanilla-zoo --scene gtnh-zoo   # judge existing reports again
+uv run e2e oracle world --variant modernity --report-dir <copy of a scene directory>       # e.g. a saved earlier run
 ```
 
 Variants (`src/e2e/oracle/variants.py`): `default` (client `clients/gtnh-2.9.0-RC-2`, BlueMap with the default
@@ -214,7 +265,9 @@ Per scene:
    detached and the three.js camera set to the client's eye, orientation and projection matrix; hires tiles loaded
    around the area the client shows; the capture conditions of the client: full brightness (`ambientLight` and
    `sunlightStrength` 1), no ambient occlusion and Minecraft's flat face shade (up 1.0, down 0.5, north/south 0.8,
-   west/east 0.6; BlueMap's own directional light is 1.0 / 0.4 / 0.82 / 0.64), no mipmaps, animations at frame 0.
+   west/east 0.6; BlueMap's own directional light is 1.0 / 0.4 / 0.82 / 0.64; vertical diagonal faces such as cross
+   plants unshaded like the client's crossed squares, with a tolerance of 0.02 on the normal components because
+   BlueMap's normals of a 45 degree rotated element are not exactly diagonal), no mipmaps, animations at frame 0.
    The colour frame is read from the WebGL buffer once two consecutive frames are identical; a second pass writes
    the hires surfaces' view-space depth (`bluemap/<view>.png`, `bluemap/<view>.depth.bin`).
 4. **Faces** (`src/e2e/oracle/faces.py`). Both renderings are labelled per pixel from their own depth and the client's
@@ -229,12 +282,36 @@ Per scene:
 6. **Metrics** per face with the shared region metrics (`src/e2e/oracle/metrics.py`): the client's region against
    BlueMap's region of the same face, leaving out pixels where the other rendering shows a nearer surface of
    something else (that difference is the occluder's). IoU, mean CIEDE2000 and SSIM; faces with fewer than 64 pixels
-   are not judged.
-7. **Thresholds** come from Tukey's far-out fences (k = 3) over the vanilla faces of `vanilla-zoo` with the default
-   variant, one sample per block state and face direction (its largest region), written by that run to
-   `out/oracle/default/worlds/calibration.json` with the distributions; every other run reads it, so run vanilla-zoo
-   first.
-8. **Report.** `report.json` (every face: block, mod, metrics, failed criteria, a first guess at the cause),
+   are not judged. **Translucent faces** show what is behind them: where either rendering shows a translucent dump
+   cell (a state whose isolated client render in the state oracle has at least half of its covered pixels below
+   alpha 250: stained glass, ice, water, ...) and the view ray, followed through the dump grid past translucent
+   cells, reaches an accepted (1.13) or excluded cell or nothing of the dump (the terrain around the scene, sky),
+   the pixel counts for the IoU but not for delta E and SSIM (`background_excluded` in the report): the colour there
+   is the background's, which is judged (or accepted) as its own face. On vanilla-zoo this is the randomly rotated
+   1.13 stone floor under every glass block.
+7. **Thresholds** come from Tukey's far-out fences (k = 3) over the inexact samples of the `vanilla-zoo` faces
+   (default variant, every face with at least 64 pixels in an aligned view) whose states look the same in 1.7.10 and
+   1.13: IoU over the faces of the `geometry` set, delta E and SSIM over the `texture` set with one sample per block
+   (its worst inexact face) of `vanilla.json` (state oracle, step
+   7 above; run `oracle states --variant default` first). That run writes `out/oracle/default/worlds/calibration.json`
+   with the distributions and the calibration faces the thresholds fail; every other run reads it, so run
+   vanilla-zoo first. Faces of states `oracle/accepted.yaml` names (where the data backs the reason) are reported as
+   `accepted (1.13)` and counted apart.
+8. **Report.** `report.json` (every face: block, mod, metrics, failed criteria, a first guess at the cause, accepted),
    `report.html` (views side by side: client, BlueMap, difference, label agreement; per-mod pass rates; the worst
    faces by mod with crops in `report/crops/`), and `../summary.json` over the variant's scenes. Exit code 1 if a
-   view failed the alignment check.
+   view failed the alignment check. `--rejudge` (with `--scene`) or `--report-dir` judge an existing `report.json`
+   again without capturing or rendering: the face metrics are recomputed from the saved captures
+   (`client/<view>.*`, `bluemap/<view>.png`, `bluemap/<view>.depth.bin`) with the current metrics, calibration and
+   `accepted.yaml` (views without a saved BlueMap depth keep their stored metrics and are listed under
+   `stored_metric_views`); rejudging vanilla-zoo of the default variant in its scene directory recalibrates.
+
+`uv run e2e oracle world-swap-test [--scene ...] [--before <old calibration.json>]` (`src/e2e/oracle/world_swap.py`)
+measures how well the world thresholds discriminate: per scene (vanilla-zoo, gt-multiblocks and gtnh-zoo by
+default) BlueMap's captures of each variant are judged against the other variant's client captures of the same
+cameras (default BlueMap vs the Modernity client and the reverse). Counted are the faces that pass in the BlueMap
+variant's own report and that the two clients draw differently (mean absolute RGB difference of the two client
+captures over the face's pixels at least 1): every one of them looks different in the reference client, so the share
+flagged is the detection rate, also reported by the size of the client difference. Faces whose two client captures
+agree (difference below 0.25) should still pass; the share that fails is the swap's false-failure rate. Writes
+`out/oracle/default/worlds/swap-test.json`.
