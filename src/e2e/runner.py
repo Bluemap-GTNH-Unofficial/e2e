@@ -140,7 +140,8 @@ def run_scene(scene: Scene, jars: bluemap.Jars, chromium: Chromium, extra_packs:
 
     dims = _select_dimensions(scene)
     port = bluemap.free_port()
-    bluemap.write_config(out, scene.world, dims, jars, port, [*scene.extra_packs, *extra_packs])
+    bluemap.write_config(out, [bluemap.MapSource(d.map_id, scene.world, d) for d in dims], jars, port,
+                         [*scene.extra_packs, *extra_packs])
     with bluemap.BlueMapCli(jars, out, port) as cli:
         result = SceneResult(scene=scene.name, out=out, port=port, maps=[d.map_id for d in dims],
                              render_seconds=cli.render_seconds, log=cli.log, log_errors=[], log_warnings=0)

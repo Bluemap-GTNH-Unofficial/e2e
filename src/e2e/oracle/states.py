@@ -2,9 +2,10 @@
 
 Per variant (outputs in ``out/oracle/<variant>/states/``, never committed):
 
-1. Reference: ``client/`` from ``gtnh-client states`` (sibling gtnh-exporter launcher): every block state the
-   exporter knows (vanilla ones from the fork's flattening table), drawn alone by the real client at two fixed
-   orthographic views, with per-pixel face IDs and ``client/index.json``.
+1. Reference: ``client/`` links to the cached capture of ``gtnh-client states`` (sibling gtnh-exporter launcher, run
+   on a cache miss; ``oracle.reference``): every block state the exporter knows (vanilla ones from the fork's
+   flattening table), drawn alone by the real client at two fixed orthographic views, with per-pixel face IDs and
+   ``client/index.json``.
 2. BlueMap: ``bluemap/`` from the fork module ``oracle`` (``./gradlew :oracle:renderStates``): the same states
    through BlueMap's hires pipeline (legacy chunk reader and flattening, gtnh-render renderers, the variant's packs),
    rasterised with the same camera.
@@ -14,10 +15,12 @@ Per variant (outputs in ``out/oracle/<variant>/states/``, never committed):
    States ``oracle/accepted.yaml`` names, where the 1.7.10 vs 1.13 data (``oracle.vanilla``) backs the reason, are
    reported as ``accepted (1.13)``, neither passing nor failing.
 
-Thresholds come from the vanilla states of the default variant that look the same in 1.7.10 and 1.13
-(``out/oracle/default/states/calibration.json``, Tukey's far-out fences over their inexact samples,
-``metrics.calibrate``): that run classifies the vanilla states (``vanilla.json``) and writes the calibration, every
-other run reads both. ``e2e oracle swap-test`` measures how many genuinely different renders the thresholds flag.
+Thresholds come from the vanilla states of the default variant that look the same in 1.7.10 and 1.13 (Tukey's
+far-out fences over their inexact samples, ``metrics.calibrate``): that run classifies the vanilla states
+(``vanilla.json``) and calibrates once per state reference; the calibration is stored in the reference cache keyed
+by that reference and reused until it changes or ``--recalibrate`` (``out/oracle/default/states/calibration.json`` is
+the active copy, which every other variant reads). ``e2e oracle swap-test`` measures how many genuinely different
+renders the thresholds flag.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ import numpy as np
 from PIL import Image
 
 from e2e import bluemap, paths
-from e2e.oracle import accepted, metrics, states_report, vanilla, variants
+from e2e.oracle import accepted, metrics, reference, states_report, vanilla, variants
 
 VIEWS = ("se", "nw")
 VIEW_SIZE = 128
@@ -54,7 +57,17 @@ def states_dir(variant: variants.Variant | str) -> Path:
 
 
 def calibration_file() -> Path:
+    """The active state calibration (a copy of the stored one in use), read by the reports and the swap test."""
     return states_dir(CALIBRATION_VARIANT) / "calibration.json"
+
+
+def calibration_target() -> tuple[dict, Path | None]:
+    """The reference the default variant's state oracle is linked to (``states/reference.json``) and the stored
+    calibration keyed by it (None when there is no recorded reference)."""
+    references = {"states": reference.recorded_key(states_dir(CALIBRATION_VARIANT))}
+    if references["states"] is None:
+        return references, None
+    return references, reference.calibration_path("states", reference.calibration_key("states", references))
 
 
 # --- BlueMap side ------------------------------------------------------------------------------------------------
@@ -351,11 +364,17 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
     accepted_list = accepted.load(classes, vanilla.texture_overrides(variant.bluemap_packs))
     calibration_written = False
     provisional = False
-    if variant.name == CALIBRATION_VARIANT and not only and (recalibrate or not calibration_file().is_file()):
+    references, artifact = calibration_target()
+    stored = artifact.is_file() if artifact else calibration_file().is_file()
+    if variant.name == CALIBRATION_VARIANT and not only and (recalibrate or not stored):
         judge, calibration = calibrate(results, raw, classes, accepted_list)
-        calibration_file().write_text(json.dumps(calibration, indent=1), encoding="utf-8")
+        calibration |= {"version": reference.CALIBRATION_VERSION, "references": references,
+                        "artifact": str(artifact) if artifact else None}
+        reference.store_calibration(calibration, artifact, calibration_file())
         calibration_written = True
-    elif calibration_file().is_file():
+    elif stored:
+        if artifact:
+            reference.install_calibration(artifact, calibration_file())
         judge = load_judge(calibration_file())
     elif variant.name == CALIBRATION_VARIANT:
         # a subset run before any full run: judge with thresholds from the subset's vanilla states, write nothing
@@ -363,7 +382,9 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
         provisional = True
         print("[states] no calibration yet: provisional thresholds from this subset's vanilla states", flush=True)
     else:
-        raise FileNotFoundError(f"{calibration_file()} missing: run `e2e oracle states --variant {CALIBRATION_VARIANT}` first")
+        raise FileNotFoundError(f"no state calibration for the default variant's reference "
+                                f"({artifact or calibration_file()}): run `e2e oracle states --variant "
+                                f"{CALIBRATION_VARIANT}` first")
 
     for r in results:
         if r["status"] != "pending":
@@ -535,6 +556,13 @@ def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
     p.add_argument("--recalibrate", action="store_true",
                    help=f"recompute the thresholds from this run's vanilla states (variant {CALIBRATION_VARIANT} only)")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="comparison processes")
+    p.add_argument("--recapture", action="store_true",
+                   help="capture the client reference (gtnh-client states) even if it is cached")
+    p.add_argument("--no-capture", action="store_true",
+                   help="never launch a client: without a cached reference, compare against the existing client/ "
+                        "(reported as stale) or fail")
+    p.add_argument("--parallel", type=int, help="client instances for the reference capture (gtnh-client --parallel)")
+    p.add_argument("--mod-jar", type=Path, help="exporter jar for the reference capture (default: the launcher builds it)")
     p.set_defaults(func=cmd_states)
     s = oracle_sub.add_parser("swap-test", help="detection power of the state thresholds: Modernity client renders "
                                                 "against default client renders of the same states")
@@ -548,5 +576,11 @@ def cmd_states(args: argparse.Namespace) -> int:
         raise SystemExit(f"--recalibrate only applies to --variant {CALIBRATION_VARIANT}")
     if args.only and args.recalibrate:
         raise SystemExit("--recalibrate needs the full state set (no --only)")
-    return run(variants.load(args.variant), render=not args.no_render, only=args.only, workers=args.workers,
-               recalibrate=args.recalibrate)
+    variant = variants.load(args.variant)
+    missing = variant.missing()
+    if missing:
+        raise FileNotFoundError(f"variant {variant.name}: missing {', '.join(map(str, missing))}")
+    inputs = reference.Inputs.open(variant.pack)
+    reference.ensure_states(variant, states_dir(variant), inputs, recapture=args.recapture, capture=not args.no_capture,
+                            options=reference.LaunchOptions(args.mod_jar, args.parallel))
+    return run(variant, render=not args.no_render, only=args.only, workers=args.workers, recalibrate=args.recalibrate)

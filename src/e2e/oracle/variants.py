@@ -1,14 +1,15 @@
 """Oracle variants: which client draws the reference and which resource packs BlueMap renders with, per GTNH pack
 version (``e2e --pack-version``, default 2.9.0; ``paths.Pack``: per-version directories end in ``-<version>``).
 
-| Variant | Client | Client packs / mods (this run only) | BlueMap packs | Scene server |
+| Variant | Client | Client packs / mods (this run only) | BlueMap packs | State list from |
 |---|---|---|---|---|
-| `default` | `clients/gtnh-<version>` | - | the default export | `gtnh-<version>` (2.9.0: 25569 / 25579) |
-| `modernity` | `clients/gtnh-modernity-<version>` | the Modernity release zip / its MyCTMLib jar | default export + both `modernity` packs | `gtnh-<version>` |
-| `addons` | `clients/gtnh-addons-<version>` | - / the addon jars of the version in `downloads/addons/versions.json` | the addons export | `gtnh-addons-<version>` (2.9.0: 25572 / 25582) |
+| `default` | `clients/gtnh-<version>` | - | the default export | the default export |
+| `modernity` | `clients/gtnh-modernity-<version>` | the Modernity release zip / its MyCTMLib jar | default export + both `modernity` packs | the default export |
+| `addons` | `clients/gtnh-addons-<version>` | - / the addon jars of the version in `downloads/addons/versions.json` | the addons export | the addons export |
 
 Every path is under the workspace (`paths.workspace()`); the newest matching file is taken where a name carries a
-release id. `missing()` lists the inputs that do not exist yet.
+release id. `missing()` lists the inputs that do not exist yet. The client opens each scene world as a single-player
+save (`gtnh-client cameras --jobs`), so no variant needs a scene server.
 """
 
 from __future__ import annotations
@@ -30,9 +31,7 @@ class Variant:
     resource_packs: tuple[Path, ...]  # client resource packs, first = highest priority
     extra_mods: tuple[Path, ...]  # client mods installed for the run only
     bluemap_packs: tuple[Path, ...]  # files for BlueMap's packs/ (BlueMap orders them by reverse file name)
-    server: str  # directory under <workspace>/servers that runs the scene worlds
-    server_port: int
-    rcon_port: int
+    states_from: Path  # exported pack whose gtnh/blocks.ndjson lists the modded states of the state oracle
 
     def missing(self) -> list[Path]:
         """Inputs (client directory, packs, mods) that do not exist."""
@@ -80,9 +79,7 @@ def load(name: str, pack_version: str | None = None) -> Variant:
             resource_packs=(),
             extra_mods=(),
             bluemap_packs=(pack.export,),
-            server=pack.server,
-            server_port=pack.server_port,
-            rcon_port=pack.rcon_port,
+            states_from=pack.export,
         )
     if name == "modernity":
         modpack, myctmlib = _modernity_downloads(ws)
@@ -95,9 +92,7 @@ def load(name: str, pack_version: str | None = None) -> Variant:
             extra_mods=(myctmlib,),
             bluemap_packs=(pack.export, _newest(out, f"modernity-*-modded-{pack.version}.zip"),
                            _newest(out, "modernity-*-vanilla-*.zip")),  # fmt: skip
-            server=pack.server,
-            server_port=pack.server_port,
-            rcon_port=pack.rcon_port,
+            states_from=pack.export,
         )
     if name == "addons":
         return Variant(
@@ -107,9 +102,7 @@ def load(name: str, pack_version: str | None = None) -> Variant:
             resource_packs=(),
             extra_mods=_addon_jars(ws, pack.version),
             bluemap_packs=(pack.addons_export,),
-            server=pack.addon_server,
-            server_port=pack.addon_server_port,
-            rcon_port=pack.addon_rcon_port,
+            states_from=pack.addons_export,
         )
     raise ValueError(f"unknown variant {name!r}; known: {', '.join(NAMES)}")
 

@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from e2e import paths
-from e2e.oracle import states, vanilla, variants
+from e2e.oracle import reference, states, vanilla, variants
 
 PALETTE = [0, 0, 0, 64, 64, 64, 255, 255, 255, 255, 0, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 255, 0, 255]
 
@@ -149,3 +149,18 @@ def test_run_judges_reports_and_calibrates(workspace):
     # a second run reads the calibration instead of writing it
     assert states.run(variants.load("default"), render=False, only="mod:", workers=1, recalibrate=False) == 1
     assert json.loads((out / "report.json").read_text())["calibrationWritten"] is False
+
+    # keyed by the state reference: stored once per reference and reused, a new reference calibrates again
+    reference.record(out, {"key": "a" * 64})
+    assert states.run(variants.load("default"), render=False, only=None, workers=1, recalibrate=False) == 1
+    assert json.loads((out / "report.json").read_text())["calibrationWritten"] is True
+    _, artifact = states.calibration_target()
+    assert artifact.is_file() and json.loads(artifact.read_text())["references"] == {"states": "a" * 64}
+    states.calibration_file().write_text("{}")  # the active copy is restored from the artifact
+    assert states.run(variants.load("default"), render=False, only=None, workers=1, recalibrate=False) == 1
+    assert json.loads((out / "report.json").read_text())["calibrationWritten"] is False
+    assert json.loads(states.calibration_file().read_text()) == json.loads(artifact.read_text())
+    reference.record(out, {"key": "b" * 64})
+    assert states.run(variants.load("default"), render=False, only=None, workers=1, recalibrate=False) == 1
+    assert json.loads((out / "report.json").read_text())["calibrationWritten"] is True
+    assert states.calibration_target()[1] != artifact

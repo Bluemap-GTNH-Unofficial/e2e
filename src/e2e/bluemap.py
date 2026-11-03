@@ -41,6 +41,22 @@ class Dimension:
     folder: Path
 
 
+@dataclass(frozen=True)
+class MapSource:
+    """One configured map: its id (the webapp's map id and config file name, see ``map_id``), the world and the
+    dimension."""
+
+    map_id: str
+    world: Path
+    dimension: Dimension
+
+
+def map_id(name: str) -> str:
+    """The map id BlueMap derives from a map config named ``<name>.conf``: every character other than ASCII letters,
+    digits and ``_`` becomes ``_`` (``BlueMapConfigManager.sanitiseMapId``), so ``gt-ores`` is ``gt_ores``."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def java() -> str:
     env = os.environ.get("BMGTNH_JAVA")
     if env:
@@ -132,12 +148,13 @@ def _hocon(value: object) -> str:
     return json.dumps(value)
 
 
-def _map_conf(world: Path, dim: Dimension, sorting: int) -> str:
+def _map_conf(source: MapSource, sorting: int) -> str:
+    dim = source.dimension
     settings: dict[str, object] = {
-        "world": str(world),
+        "world": str(source.world),
         "loader": LOADER,
         "dimension": dim.key,
-        "name": f"{dim.map_id} ({world.name})",
+        "name": f"{dim.map_id} ({source.world.name})",
         "sorting": sorting,
         "storage": "file",
     }
@@ -155,9 +172,9 @@ def _map_conf(world: Path, dim: Dimension, sorting: int) -> str:
     return "".join(f"{key}: {_hocon(value)}\n" for key, value in settings.items())
 
 
-def write_config(root: Path, world: Path, dims: list[Dimension], jars: Jars, port: int,
-                 extra_packs: list[Path]) -> Path:
-    """A fresh CLI config under ``root/config``; data and webroot live next to it in ``root``."""
+def write_config(root: Path, maps: list[MapSource], jars: Jars, port: int, extra_packs: list[Path]) -> Path:
+    """A fresh CLI config under ``root/config`` with ``maps`` (one CLI process renders them all); data and webroot
+    live next to it in ``root``."""
     config = root / "config"
     packs = config / "packs"
     for sub in (config / "maps", config / "storages", packs):
@@ -185,8 +202,8 @@ def write_config(root: Path, world: Path, dims: list[Dimension], jars: Jars, por
     (config / "storages" / "file.conf").write_text(
         f"storage-type: file\nroot: {_hocon(str(web / 'maps'))}\ncompression: gzip\n", encoding="utf-8"
     )
-    for i, dim in enumerate(dims):
-        (config / "maps" / f"{dim.map_id}.conf").write_text(_map_conf(world, dim, i), encoding="utf-8")
+    for i, source in enumerate(maps):
+        (config / "maps" / f"{source.map_id}.conf").write_text(_map_conf(source, i), encoding="utf-8")
     for jar in jars.addons:
         shutil.copy2(jar, packs / jar.name)
     for source in extra_packs:

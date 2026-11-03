@@ -32,3 +32,15 @@ def test_view_hash_has_the_ten_fields_the_webapp_parses() -> None:
                 mode="flat")
     assert view.hash == "dim_64:18:5.5:-17:30:0.6:0.9:0:1:flat"
     assert len(view.hash.split(":")) == 10
+
+
+def test_map_ids_follow_bluemaps_sanitising(tmp_path: Path) -> None:
+    assert bluemap.map_id("gt-ores") == "gt_ores" and bluemap.map_id("vanilla_zoo2") == "vanilla_zoo2"
+    world = tmp_path / "world"
+    _region(world)
+    dim = bluemap.detect_dimensions(world)[0]
+    jars = bluemap.Jars(tmp_path / "cli.jar", ())
+    config = bluemap.write_config(tmp_path / "root", [bluemap.MapSource(bluemap.map_id("gt-ores"), world, dim),
+                                                      bluemap.MapSource("overworld", world, dim)], jars, 8200, [])
+    assert sorted(p.name for p in (config / "maps").iterdir()) == ["gt_ores.conf", "overworld.conf"]
+    assert f'world: "{world}"' in (config / "maps" / "gt_ores.conf").read_text()

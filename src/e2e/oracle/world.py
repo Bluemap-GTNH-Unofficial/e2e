@@ -3,12 +3,13 @@
 Per scene and variant (outputs in ``out/oracle/<variant>/worlds/<scene>/``, never committed):
 
 1. ``cameras.json``: the scene's oracle cameras (``oracle.camera``).
-2. Reference: ``client/<view>.{png,depth.bin,json}`` from ``gtnh-client cameras`` (the client joins a server running
-   the scene world; see the launcher README). Captured again when missing, when the camera list changed, or with
-   ``--capture always``.
-3. BlueMap: the scene rendered with the BlueMap CLI and the variant's packs (``bluemap/``), served, and captured at
-   the client's exact matrices with the capture conditions of the client (``oracle.webapp``):
-   ``bluemap/<view>.png`` and ``bluemap/<view>.depth.bin`` (float32 view-space depth, NaN = nothing drawn).
+2. Reference: ``client/`` links to the client's captures in the reference cache (``oracle.reference``), keyed by
+   everything the client sees (pack version, client mods and packs, scene content, cameras, capture settings). The
+   misses of all scenes of a variant are captured with one ``gtnh-client cameras --jobs`` (see the launcher README).
+3. BlueMap: every scene of a variant rendered by one BlueMap CLI process with the variant's packs (one map per scene,
+   ``worlds/_bluemap/``), served, and captured at the client's exact matrices with the capture conditions of the
+   client (``oracle.webapp``): ``bluemap/<view>.png`` and ``bluemap/<view>.depth.bin`` (float32 view-space depth,
+   NaN = nothing drawn).
 4. Faces: both renderings are labelled per pixel with the dump block and cell face they show (``oracle.faces``);
    alignment is checked first (block-edge reprojection error, global shift), then every face of a dump block that
    either rendering shows is compared with the shared region metrics (``oracle.metrics``).
@@ -16,10 +17,11 @@ Per scene and variant (outputs in ``out/oracle/<variant>/worlds/<scene>/``, neve
 
 Pass thresholds come from a calibration on the faces of ``vanilla-zoo`` (default variant) whose vanilla states look
 the same in 1.7.10 and 1.13 (``oracle.vanilla``, from the default state run): Tukey's far-out fences over their
-inexact samples, never tuned by hand (``out/oracle/default/worlds/calibration.json``); that run writes it, every other
-run reads it. Faces of states ``oracle/accepted.yaml`` names (when the data backs the reason) are reported as
-``accepted (1.13)``, neither passing nor failing. ``--rejudge`` / ``--report-dir`` judge an existing ``report.json``
-again without capturing or rendering.
+inexact samples, never tuned by hand. The calibration is stored in the reference cache, keyed by the references it
+was computed from (vanilla-zoo's world reference and the default variant's state reference), and reused until they
+change or ``--recalibrate``; ``out/oracle/default/worlds/calibration.json`` is the active copy. Faces of states
+``oracle/accepted.yaml`` names (when the data backs the reason) are reported as ``accepted (1.13)``, neither passing
+nor failing. ``--rejudge`` / ``--report-dir`` judge an existing ``report.json`` again without capturing or rendering.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ import argparse
 import json
 import math
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from e2e import bluemap, paths, runner, scenes
 from e2e import metrics as image_metrics
 from e2e.browser import CHROMIUM_ARGS
 from e2e.oracle import camera as cameras
-from e2e.oracle import accepted, faces, metrics, vanilla, variants, webapp, world_report
+from e2e.oracle import accepted, faces, metrics, reference, vanilla, variants, webapp, world_report
 
 CALIBRATION_SCENE = "vanilla-zoo"
 CALIBRATION_VARIANT = "default"
@@ -96,48 +97,71 @@ def dump_keys(blocks: dict[tuple[int, int, int], Block]) -> np.ndarray:
     return np.concatenate([faces.encode(cells, np.full(len(cells), f)) for f in range(len(faces.FACES))])
 
 
-# ---------------------------------------------------------------- reference capture
+# ---------------------------------------------------------------- scenes of a run
 
 
-def client_complete(client_dir: Path, data: dict) -> bool:
-    """True when every camera of ``data`` has a capture made with exactly this camera definition and removals."""
-    spec = client_dir / "spec.json"
-    if not spec.is_file():
-        return False
-    spec_data = json.loads(spec.read_text(encoding="utf-8"))
-    if spec_data.get("cameras") != data["cameras"] or spec_data.get("remove", []) != data["remove"]:
-        return False
-    return all((client_dir / f"{c['name']}{s}").is_file() for c in data["cameras"] for s in (".png", ".depth.bin", ".json"))
+def oracle_scenes(variant: variants.Variant, only: list[str] | None = None) -> list[str]:
+    """The scenes ``--all`` runs for a variant: every scene with oracle cameras and a dump whose packs fit the variant
+    (scenes on the addons export belong to ``addons``, the others to ``default`` and ``modernity``); with ``only``
+    (``--all --scene ...``) just those of them, the others printed as skipped."""
+    found = []
+    for name in scenes.names():
+        if only is not None and name not in only:
+            continue
+        spec = scenes.load(name)
+        if (variant.pack.addons_export in spec.extra_packs) != (variant.name == "addons"):
+            if only is not None:
+                print(f"[oracle] --all: {variant.name}/{name} skipped, a scene of another variant", flush=True)
+            continue
+        if not (paths.scenes_dir() / name / "dump.ndjson").is_file():
+            print(f"[oracle] --all: {variant.name}/{name} skipped, no dump in {paths.scenes_dir() / name}", flush=True)
+            continue
+        try:
+            cameras.scene_cameras(name)
+        except ValueError as e:
+            print(f"[oracle] --all: {variant.name}/{name} skipped ({e})", flush=True)
+            continue
+        found.append(name)
+    for name in sorted(set(only or ()) - set(scenes.names())):
+        print(f"[oracle] --all: {name} skipped, no scenes/{name}.yaml", flush=True)
+    return found
 
 
-def capture_reference(variant: variants.Variant, scene: str, cameras_file: Path, client_dir: Path, log: Path,
-                      mod_jar: Path | None) -> float:
-    """Runs `gtnh-client cameras` in the sibling launcher checkout; returns its wall time."""
-    launcher = paths.workspace() / "gtnh-exporter" / "launcher"
-    cmd = ["uv", "run", "gtnh-client", "cameras", "--pack-version", variant.pack.version, "--scene", scene,
-           "--variant", variant.name, "--cameras", str(cameras_file), "--out", str(client_dir),
-           "--client-dir", str(variant.client_dir), "--server-dir", variant.server, "--port", str(variant.server_port),
-           "--rcon-port", str(variant.rcon_port)]  # fmt: skip
-    cmd += [f"--resource-pack={p}" for p in variant.resource_packs]
-    cmd += [f"--extra-mod={m}" for m in variant.extra_mods]
-    if mod_jar:  # the launcher runs in its own checkout, so a relative path must be resolved here
-        cmd += ["--mod-jar", str(mod_jar.resolve())]
-    print(f"[oracle] reference capture: {subprocess.list2cmdline(cmd)}", flush=True)
-    started = time.monotonic()
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("wb") as out:
-        proc = subprocess.Popen(cmd, cwd=launcher, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            out.write(line)
-            if line.startswith(b"[cameras]") or line.startswith(b"[run]") or b"Camera " in line:
-                sys.stdout.buffer.write(line)
-                sys.stdout.flush()
-        code = proc.wait()
-    if code != 0:
-        print(f"[oracle] reference capture exited with {code} (log {log}); comparing the cameras that were captured",
-              file=sys.stderr)
-    return time.monotonic() - started
+@dataclass
+class SceneRun:
+    """One scene of one variant in a run: cameras, dump and reference."""
+
+    variant: variants.Variant
+    scene: str
+    out: Path
+    camera_list: list[cameras.Camera]
+    blocks: dict
+    removed: list
+    removed_states: list[str]
+    job: reference.WorldJob
+    packs: list[Path]
+
+    @property
+    def calibrating_pair(self) -> bool:
+        return self.variant.name == CALIBRATION_VARIANT and self.scene == CALIBRATION_SCENE
+
+
+def prepare(variant: variants.Variant, scene: str, inputs: reference.Inputs) -> SceneRun:
+    """Writes ``cameras.json`` and computes the scene's reference key."""
+    out = scene_dir(variant, scene)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "client.log").unlink(missing_ok=True)  # launcher log of the pre-cache captures; now under oracle-ref/logs
+    camera_list = cameras.scene_cameras(scene)
+    blocks, removed, removed_states = scene_blocks(scene)
+    data = cameras.cameras_json(scene, camera_list, removed)
+    cameras_file = out / "cameras.json"
+    cameras_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    spec = scenes.load(scene)
+    if not spec.world.is_dir():
+        raise FileNotFoundError(f"scene world {spec.world} does not exist; build it with `orch scene {scene}`")
+    job = reference.WorldJob(variant, scene, spec.world, cameras_file, data, inputs.world(variant, scene, data))
+    packs = list(dict.fromkeys([*spec.extra_packs, *variant.bluemap_packs]))
+    return SceneRun(variant, scene, out, camera_list, blocks, removed, removed_states, job, packs)
 
 
 # ---------------------------------------------------------------- comparison
@@ -372,9 +396,52 @@ def area(client: cameras.ClientView, keys: np.ndarray) -> tuple[tuple[float, flo
     return (float(centre[0]), float(centre[1]), float(centre[2])), float(np.linalg.norm(high - low) / 2.0 + 48.0)
 
 
-def load_thresholds(variant: variants.Variant, scene: str) -> metrics.Thresholds | None:
-    if variant.name == CALIBRATION_VARIANT and scene == CALIBRATION_SCENE:
-        return None  # this run produces the calibration
+@dataclass
+class CalibrationPlan:
+    """Where a run's thresholds come from: ``compute`` (the calibration scene of this run calibrates and stores the
+    result under ``artifact`` and as the active ``calibration_file()``), else the stored ``artifact``, installed as
+    the active file. ``artifact`` is None when the references are not known or not current (then only the active
+    file is written)."""
+
+    compute: bool
+    artifact: Path | None
+    references: dict | None
+
+
+def calibration_references(world_key: str | None, states_key: str | None) -> tuple[dict, Path | None]:
+    references = {"world": world_key, "states": states_key}
+    if world_key is None:
+        return references, None
+    return references, reference.calibration_path("world", reference.calibration_key("world", references))
+
+
+def plan_calibration(runs: list[SceneRun], inputs: reference.Inputs, recalibrate: bool) -> CalibrationPlan:
+    """The stored calibration for the current references of the calibration scene (``vanilla-zoo``, default variant)
+    and of the default variant's state oracle, unless ``recalibrate`` or there is none: then the calibration scene
+    must be part of the run and calibrates."""
+    from e2e.oracle import states
+
+    default = variants.load(CALIBRATION_VARIANT)
+    own = next((r for r in runs if r.calibrating_pair), None)
+    world_key = own.job.key if own else inputs.world(
+        default, CALIBRATION_SCENE, cameras.cameras_json(CALIBRATION_SCENE, cameras.scene_cameras(CALIBRATION_SCENE),
+                                                         scene_blocks(CALIBRATION_SCENE)[1]))
+    states_key = reference.recorded_key(states.states_dir(default)) or inputs.states(default).digest
+    references, artifact = calibration_references(world_key.digest, states_key)
+    if not recalibrate and artifact is not None and artifact.is_file():
+        reference.install_calibration(artifact, calibration_file())
+        print(f"[oracle] world calibration {artifact.name} (references unchanged)", flush=True)
+        return CalibrationPlan(False, artifact, references)
+    if own is None:
+        why = "--recalibrate" if recalibrate else f"no world calibration for the current references ({artifact.name})"
+        raise SystemExit(f"{why}: add `--variant {CALIBRATION_VARIANT} --scene {CALIBRATION_SCENE}` (or use --all) so "
+                         f"that it is calibrated first")
+    print(f"[oracle] world calibration: {CALIBRATION_VARIANT}/{CALIBRATION_SCENE} calibrates "
+          f"({'--recalibrate' if recalibrate else 'no stored calibration for its references'})", flush=True)
+    return CalibrationPlan(True, artifact, references)
+
+
+def active_thresholds() -> metrics.Thresholds:
     path = calibration_file()
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist; run `uv run e2e oracle world --variant {CALIBRATION_VARIANT} "
@@ -416,10 +483,11 @@ def false_failures(views: list[ViewOutcome], thresholds: metrics.Thresholds, lab
             "rate": round(len(failing_states) / len(states), 4) if states else None, "failing": failing_states}
 
 
-def calibrate(views: list[ViewOutcome], classes: dict,
-              accepted_list: accepted.Accepted) -> tuple[metrics.Thresholds, dict]:
+def calibrate(views: list[ViewOutcome], classes: dict, accepted_list: accepted.Accepted,
+              plan: CalibrationPlan) -> tuple[metrics.Thresholds, dict]:
     """Thresholds from the faces of the calibration run's vanilla states that look the same in 1.7.10 and 1.13: IoU
-    over the ``geometry`` set, delta E and SSIM over the ``texture`` set (``oracle.vanilla``)."""
+    over the ``geometry`` set, delta E and SSIM over the ``texture`` set (``oracle.vanilla``). Stored as the
+    artifact of ``plan`` (keyed by the references) and as the active ``calibration_file()``."""
     labels = calibration_labels(classes, accepted_list)
     texture = calibration_samples(views, labels["texture"])
     geometry = calibration_samples(views, labels["geometry"])
@@ -427,6 +495,8 @@ def calibrate(views: list[ViewOutcome], classes: dict,
                                     geometry_samples=[region_metrics(f) for f in geometry],
                                     groups=[f["block"] for f in texture], min_pixels=MIN_PIXELS)
     data = {**calibration.to_json(), "scene": CALIBRATION_SCENE, "variant": CALIBRATION_VARIANT,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "version": reference.CALIBRATION_VERSION,
+            "references": plan.references, "artifact": str(plan.artifact) if plan.artifact else None,
             "classification": str(vanilla.file()),
             "unit": f"every face of a calibration state with at least {MIN_PIXELS} pixels in an aligned view (IoU); "
                     f"each block's worst inexact face (delta E, SSIM)",
@@ -434,9 +504,7 @@ def calibrate(views: list[ViewOutcome], classes: dict,
                              "geometry": len({f["label"] for f in geometry})},
             "falseFailures": {name: false_failures(views, calibration.thresholds, labels[name])
                               for name in ("texture", "geometry")}}
-    path = calibration_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    reference.store_calibration(data, plan.artifact, calibration_file())
     return calibration.thresholds, data
 
 
@@ -507,76 +575,117 @@ def summarize(views: list[ViewOutcome]) -> dict:
     }
 
 
-def run_scene(variant: variants.Variant, scene: str, jars: bluemap.Jars, browser, args: argparse.Namespace) -> dict:
+@dataclass
+class RenderGroup:
+    """Scenes of one variant with the same BlueMap packs: one CLI process renders all of them (one map each, map id =
+    scene name) and serves them while their views are captured."""
+
+    variant: variants.Variant
+    packs: list[Path]
+    runs: list[SceneRun]
+    root: Path
+
+
+def render_groups(runs: list[SceneRun]) -> list[RenderGroup]:
+    """``runs`` grouped by variant and packs, in the order of their first scene (the calibration scene stays first)."""
+    groups: dict[tuple, RenderGroup] = {}
+    for run in runs:
+        key = (run.variant.name, tuple(run.packs))
+        if key not in groups:
+            n = sum(1 for g in groups.values() if g.variant.name == run.variant.name)
+            root = variants.oracle_dir(run.variant) / "worlds" / ("_bluemap" if n == 0 else f"_bluemap-{n + 1}")
+            groups[key] = RenderGroup(run.variant, run.packs, [], root)
+        groups[key].runs.append(run)
+    return list(groups.values())
+
+
+def start_bluemap(group: RenderGroup, jars: bluemap.Jars) -> bluemap.BlueMapCli:
+    """Writes the group's CLI config (every scene's overworld as one map, id ``bluemap.map_id(scene)``) and starts
+    rendering and serving."""
+    shutil.rmtree(group.root, ignore_errors=True)
+    group.root.mkdir(parents=True)
+    maps = []
+    for run in group.runs:
+        world = scenes.load(run.scene).world
+        dims = [d for d in bluemap.detect_dimensions(world) if d.map_id == "overworld"]
+        if not dims:
+            raise FileNotFoundError(f"{world} has no overworld region files")
+        maps.append(bluemap.MapSource(bluemap.map_id(run.scene), world, dims[0]))
+    ids = [m.map_id for m in maps]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"scenes {[r.scene for r in group.runs]} give ambiguous BlueMap map ids {ids}")
+    port = bluemap.free_port()
+    bluemap.write_config(group.root, maps, jars, port, group.packs)
+    (group.root / "packs.txt").write_text("".join(f"{p}\n" for p in group.packs), encoding="utf-8")
+    cli = bluemap.BlueMapCli(jars, group.root, port)
+    cli.start()
+    served = json.loads((group.root / "web" / "settings.json").read_text(encoding="utf-8")).get("maps", [])
+    if sorted(served) != sorted(ids):
+        cli.stop()
+        raise bluemap.BlueMapError(f"BlueMap serves maps {served}, expected {ids}; log {cli.log}")
+    print(f"[oracle] {group.variant.name}: BlueMap rendered {len(maps)} map(s) in {cli.render_seconds:.1f}s "
+          f"({group.root})", flush=True)
+    return cli
+
+
+def run_scene(run: SceneRun, client_dir: Path | None, cli: bluemap.BlueMapCli, group: RenderGroup, browser,
+              plan: CalibrationPlan) -> dict:
+    """BlueMap's captures of a scene from the group's running CLI, compared with the client's, judged, reported."""
     started = time.monotonic()
-    out = scene_dir(variant, scene)
-    out.mkdir(parents=True, exist_ok=True)
-    camera_list = cameras.scene_cameras(scene)
-    blocks, removed, removed_states = scene_blocks(scene)
-    data = cameras.cameras_json(scene, camera_list, removed)
-    cameras_file = out / "cameras.json"
-    cameras_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    client_dir = out / "client"
-    timings: dict[str, float] = {}
-
-    if args.capture == "always" or (args.capture == "auto" and not client_complete(client_dir, data)):
-        timings["reference_capture"] = round(capture_reference(variant, scene, cameras_file, client_dir,
-                                                               out / "client.log", args.mod_jar), 1)
-    captured = [c for c in camera_list if (client_dir / f"{c.name}.json").is_file()]
+    out, scene, variant = run.out, run.scene, run.variant
+    # bluemap_render: the group's CLI (all scenes of the batch); total: this scene's views, comparison and report
+    timings: dict[str, float | None] = {"bluemap_render": round(cli.render_seconds, 1)}
+    if run.job.seconds is not None:
+        timings["reference_capture"] = round(float(run.job.seconds), 1)
+    captured = [c for c in run.camera_list if client_dir is not None and (client_dir / f"{c.name}.json").is_file()]
     if not captured:
-        raise RuntimeError(f"no reference captures in {client_dir}; see {out / 'client.log'}")
-
-    keys = dump_keys(blocks)
-    thresholds = load_thresholds(variant, scene)
-
-    # BlueMap render with the variant's packs
-    spec = scenes.load(scene)
+        raise RuntimeError(f"{variant.name}/{scene}: no reference captures (key {run.job.key.short}"
+                           f"{', log ' + str(run.job.log) if run.job.log else ''})")
+    calibrating = run.calibrating_pair and plan.compute
+    thresholds = None if calibrating else active_thresholds()
+    keys = dump_keys(run.blocks)
     root = out / "bluemap"
-    for sub in ("config", "data", "web"):
+    for sub in ("config", "data", "web"):  # per-scene renders of earlier versions
         shutil.rmtree(root / sub, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
-    dims = [d for d in bluemap.detect_dimensions(spec.world) if d.map_id == "overworld"]
-    port = bluemap.free_port()
-    packs = list(dict.fromkeys([*spec.extra_packs, *variant.bluemap_packs]))
-    bluemap.write_config(root, spec.world, dims, jars, port, packs)
-    (root / "packs.txt").write_text("".join(f"{p}\n" for p in packs), encoding="utf-8")
-    bg = backgrounds(variant, blocks, removed, load_accepted(packs))
+    (root / "packs.txt").write_text("".join(f"{p}\n" for p in run.packs), encoding="utf-8")
+    bg = backgrounds(variant, run.blocks, run.removed, load_accepted(run.packs))
     views: list[ViewOutcome] = []
-    with bluemap.BlueMapCli(jars, root, port) as cli:
-        timings["bluemap_render"] = round(cli.render_seconds, 1)
-        for cam in camera_list:
-            view = ViewOutcome(cam.name, cam.source)
-            views.append(view)
-            if cam not in captured:
-                view.error = "no reference capture"
-                continue
-            t0 = time.monotonic()
-            client = cameras.ClientView.load(client_dir, cam.name)
-            centre, radius = area(client, keys)
-            capture = webapp.capture(browser, cli.url, "overworld", cameras.webapp_camera(client), centre, radius,
-                                     client.width, client.height)
-            t1 = time.monotonic()
-            view.faces, view.alignment, view.checks = compare_view(client, capture, blocks, keys, thresholds, out, bg)
-            view.seconds = {"webapp": round(t1 - t0, 1), "compare": round(time.monotonic() - t1, 1),
-                            "client": round(float(client.meta.get("seconds", 0.0)), 1)}
-            print(f"[oracle] {scene}/{cam.name}: {len(view.faces)} faces, alignment "
-                  f"{'ok' if view.alignment['passed'] else 'FAILED'} (shift {view.alignment['shift']}, "
-                  f"edge median {view.alignment['edge_error_median_px']} px, p90 {view.alignment['edge_error_p90_px']} px), "
-                  f"webapp {view.seconds['webapp']}s, compare {view.seconds['compare']}s", flush=True)
-        log_errors = cli.log_lines("ERROR")
-
+    for cam in run.camera_list:
+        view = ViewOutcome(cam.name, cam.source)
+        views.append(view)
+        if cam not in captured:
+            view.error = "no reference capture"
+            continue
+        t0 = time.monotonic()
+        client = cameras.ClientView.load(client_dir, cam.name)
+        centre, radius = area(client, keys)
+        capture = webapp.capture(browser, cli.url, bluemap.map_id(scene), cameras.webapp_camera(client), centre,
+                                 radius, client.width, client.height)
+        t1 = time.monotonic()
+        view.faces, view.alignment, view.checks = compare_view(client, capture, run.blocks, keys, thresholds, out, bg)
+        view.seconds = {"webapp": round(t1 - t0, 1), "compare": round(time.monotonic() - t1, 1),
+                        "client": round(float(client.meta.get("seconds", 0.0)), 1)}
+        print(f"[oracle] {variant.name}/{scene}/{cam.name}: {len(view.faces)} faces, alignment "
+              f"{'ok' if view.alignment['passed'] else 'FAILED'} (shift {view.alignment['shift']}, "
+              f"edge median {view.alignment['edge_error_median_px']} px, p90 {view.alignment['edge_error_p90_px']} px), "
+              f"webapp {view.seconds['webapp']}s, compare {view.seconds['compare']}s", flush=True)
     timings["total"] = round(time.monotonic() - started, 1)
+    ref = json.loads((out / reference.REFERENCE).read_text(encoding="utf-8")) if (out / reference.REFERENCE).is_file() else {}
     base = {
         "scene": scene,
         "variant": variant.name,
-        "bluemap_packs": [str(p) for p in packs],
+        "bluemap_packs": [str(p) for p in run.packs],
+        "bluemap_batch": [r.scene for r in group.runs],
         "client": {"dir": str(variant.client_dir), "resource_packs": [str(p) for p in variant.resource_packs],
                    "extra_mods": [str(p) for p in variant.extra_mods]},
-        "excluded": {"cells": len(removed), "states": removed_states},
+        "reference": {k: ref.get(k) for k in ("key", "entry", "cached", "complete", "stale", "wanted_key", "log")
+                      if k in ref},
+        "excluded": {"cells": len(run.removed), "states": run.removed_states},
         "timings": timings,
-        "bluemap_log_errors": log_errors[:20],
+        "bluemap_log_errors": cli.log_lines("ERROR")[:20],
     }
-    report = finish(out, base, views, calibrating=thresholds is None)
+    report = finish(out, base, views, calibrate_into=plan if calibrating else None)
     update_summary(variant)
     return report
 
@@ -586,13 +695,13 @@ def load_accepted(packs: list) -> accepted.Accepted:
     return accepted.load(vanilla.load(), vanilla.texture_overrides(Path(p) for p in packs))
 
 
-def finish(out: Path, base: dict, views: list[ViewOutcome], *, calibrating: bool) -> dict:
-    """Calibrates (the calibration run) or reads the thresholds, judges every face with them and ``accepted.yaml``,
-    writes ``report.json`` and ``report.html`` to ``out``."""
+def finish(out: Path, base: dict, views: list[ViewOutcome], *, calibrate_into: CalibrationPlan | None) -> dict:
+    """Calibrates (``calibrate_into``: the calibration scene) or reads the active thresholds, judges every face with
+    them and ``accepted.yaml``, writes ``report.json`` and ``report.html`` to ``out``."""
     classes = vanilla.load()
     accepted_list = load_accepted(base["bluemap_packs"])
-    if calibrating:
-        thresholds, calibration = calibrate(views, classes, accepted_list)
+    if calibrate_into is not None:
+        thresholds, calibration = calibrate(views, classes, accepted_list, calibrate_into)
     else:
         calibration = json.loads(calibration_file().read_text(encoding="utf-8"))
         thresholds = metrics.Thresholds.from_json(calibration["thresholds"])
@@ -617,13 +726,13 @@ def finish(out: Path, base: dict, views: list[ViewOutcome], *, calibrating: bool
     return report
 
 
-def rejudge(variant: variants.Variant, out: Path) -> dict:
+def rejudge(variant: variants.Variant, out: Path, *, recalibrate: bool = False) -> dict:
     """Judges an existing ``out/report.json`` again with the current metrics, calibration and ``accepted.yaml``,
     without capturing or rendering anything. Every view's face metrics are recomputed from the saved captures
     (``client/<view>.{png,depth.bin,json}``, ``bluemap/<view>.{png,depth.bin}``) and the scene dump; the alignment
     is kept. A view whose BlueMap depth was not saved (a partial copy) keeps its stored metrics, and the report says
-    so under ``stored_metric_views``. The calibration run (vanilla-zoo of the default variant, in its own scene
-    directory) recalibrates."""
+    so under ``stored_metric_views``. With ``recalibrate``, the calibration scene (vanilla-zoo of the default variant,
+    in its own scene directory) calibrates again, stored under the references recorded in its ``reference.json``."""
     data = json.loads((out / "report.json").read_text(encoding="utf-8"))
     if data["variant"] != variant.name:
         raise ValueError(f"{out}: report of variant {data['variant']}, not {variant.name}")
@@ -657,9 +766,15 @@ def rejudge(variant: variants.Variant, out: Path) -> dict:
     base["excluded"] = base["excluded"] or {"cells": 0, "states": []}
     base["rejudged_from"] = data.get("rejudged_from") or data["created"]
     base["stored_metric_views"] = kept
-    calibrating = (variant.name == CALIBRATION_VARIANT and data["scene"] == CALIBRATION_SCENE
-                   and out.resolve() == scene_dir(variant, CALIBRATION_SCENE).resolve())
-    return finish(out, base, views, calibrating=calibrating)
+    calibrate_into = None
+    if (recalibrate and variant.name == CALIBRATION_VARIANT and data["scene"] == CALIBRATION_SCENE
+            and out.resolve() == scene_dir(variant, CALIBRATION_SCENE).resolve()):
+        from e2e.oracle import states
+
+        references, artifact = calibration_references(reference.recorded_key(out),
+                                                      reference.recorded_key(states.states_dir(CALIBRATION_VARIANT)))
+        calibrate_into = CalibrationPlan(True, artifact, references)
+    return finish(out, base, views, calibrate_into=calibrate_into)
 
 
 def scene_blocks(scene: str) -> tuple[dict, list, list[str]]:
@@ -686,60 +801,119 @@ def update_summary(variant: variants.Variant) -> Path:
     return path
 
 
-def cmd_world(args: argparse.Namespace) -> int:
-    variant = variants.load(args.variant)
-    if args.rejudge or args.report_dir:
+def cmd_rejudge(args: argparse.Namespace, variant_list: list[variants.Variant]) -> int:
+    if args.report_dir and len(variant_list) != 1:
+        raise SystemExit("--report-dir takes exactly one --variant")
+    if args.recalibrate and not (CALIBRATION_SCENE in (args.scene or [])
+                                 and any(v.name == CALIBRATION_VARIANT for v in variant_list)):
+        raise SystemExit(f"--rejudge --recalibrate needs --variant {CALIBRATION_VARIANT} --scene {CALIBRATION_SCENE}")
+    variant_list = sorted(variant_list, key=lambda v: v.name != CALIBRATION_VARIANT)  # calibrate first
+    for variant in variant_list:
         targets = [scene_dir(variant, s) for s in args.scene or []] + list(args.report_dir or [])
         if not targets:
             raise SystemExit("--rejudge needs --scene or --report-dir")
-        if CALIBRATION_SCENE in (args.scene or []) and variant.name == CALIBRATION_VARIANT:  # calibrate first
-            targets.sort(key=lambda t: t != scene_dir(variant, CALIBRATION_SCENE))
+        targets.sort(key=lambda t: t != scene_dir(variant, CALIBRATION_SCENE))
         for out in targets:
-            s = rejudge(variant, out)["summary"]
+            s = rejudge(variant, out, recalibrate=args.recalibrate)["summary"]
             rate = "-" if s["pass_rate"] is None else f"{s['pass_rate']:.2%}"
             print(f"[oracle] {variant.name}/{out.name} rejudged: {s['passed']}/{s['judged']} faces pass ({rate}), "
                   f"{s['accepted']} faces accepted (1.13); {out / 'report.html'}", flush=True)
         if args.scene:
             update_summary(variant)
+    return 0
+
+
+def cmd_world(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    variant_list = [variants.load(v) for v in dict.fromkeys(args.variant or ["default"])]
+    if args.rejudge or args.report_dir:
+        return cmd_rejudge(args, variant_list)
+    if not args.scene and not args.all:
+        raise SystemExit("--scene or --all is required")
+    for variant in variant_list:
+        missing = variant.missing()
+        if missing:
+            raise FileNotFoundError(f"variant {variant.name}: missing {', '.join(str(p) for p in missing)}")
+
+    # references: keys, cache hits, one client batch per variant for the misses
+    inputs = reference.Inputs.open()
+    selected = {v.name: oracle_scenes(v, args.scene) if args.all else args.scene for v in variant_list}
+    runs = [prepare(v, s, inputs) for v in variant_list for s in selected[v.name]]
+    if not runs:
+        print("[oracle] no scene to run", flush=True)
         return 0
-    if not args.scene:
-        raise SystemExit("--scene is required")
-    # BlueMap packs are always needed; the client, its packs and mods only for a reference capture
-    needed = variant.bluemap_packs if args.capture == "never" else variant.missing()
-    missing = [p for p in needed if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"variant {variant.name}: missing {', '.join(str(p) for p in missing)}")
+    runs.sort(key=lambda r: not r.calibrating_pair)  # the calibration scene is judged first
+    plan = plan_calibration(runs, inputs, args.recalibrate)
+    inputs.save()
+    t_keys = time.monotonic()
+    reference.capture_world([r.job for r in runs], recapture=args.recapture, capture=not args.no_capture,
+                            options=reference.LaunchOptions(args.mod_jar, args.parallel))
+    t_refs = time.monotonic()
+    client_dirs = {id(r): reference.use_world(r.job, r.out) for r in runs}
+    own = next((r for r in runs if r.calibrating_pair), None)
+    if plan.compute and own is not None and not own.job.complete:
+        print(f"[oracle] the calibration scene's reference is not complete or not current: its calibration is "
+              f"written to {calibration_file()} only, not stored for the references", file=sys.stderr, flush=True)
+        plan.artifact = None
+    hits = sum(r.job.cached for r in runs)
+    print(f"[oracle] references: {hits}/{len(runs)} cached, keys {t_keys - started:.1f}s, "
+          f"capture {t_refs - t_keys:.1f}s", flush=True)
+
     jars = runner.prepare_jars(build=not args.no_build)
     failed = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         try:
-            for scene in args.scene:
-                report = run_scene(variant, scene, jars, browser, args)
-                s = report["summary"]
-                rate = "-" if s["pass_rate"] is None else f"{s['pass_rate']:.2%}"
-                print(f"[oracle] {variant.name}/{scene}: {s['passed']}/{s['judged']} faces pass ({rate}), "
-                      f"{s['views_aligned']}/{s['views']} views aligned, {report['timings']['total']:.0f}s; "
-                      f"{scene_dir(variant, scene) / 'report.html'}", flush=True)
-                if s["views_aligned"] < s["views"]:
-                    failed.append(scene)
+            for group in render_groups(runs):
+                cli = start_bluemap(group, jars)
+                try:
+                    for run in group.runs:
+                        try:
+                            report = run_scene(run, client_dirs[id(run)], cli, group, browser, plan)
+                        except RuntimeError as e:
+                            if run.calibrating_pair and plan.compute:
+                                raise SystemExit(f"[oracle] the calibration scene failed, nothing can be judged: {e}")
+                            print(f"[oracle] {e}", file=sys.stderr, flush=True)
+                            failed.append(f"{run.variant.name}/{run.scene}")
+                            continue
+                        s = report["summary"]
+                        rate = "-" if s["pass_rate"] is None else f"{s['pass_rate']:.2%}"
+                        print(f"[oracle] {run.variant.name}/{run.scene}: {s['passed']}/{s['judged']} faces pass "
+                              f"({rate}), {s['views_aligned']}/{s['views']} views aligned, "
+                              f"{report['timings']['total']:.0f}s; {run.out / 'report.html'}", flush=True)
+                        if s["views_aligned"] < s["views"]:
+                            failed.append(f"{run.variant.name}/{run.scene}")
+                finally:
+                    cli.stop()
         finally:
             browser.close()
+    print(f"[oracle] {len(runs)} scene runs in {time.monotonic() - started:.0f}s (references {t_refs - started:.0f}s)"
+          + (f"; failed: {', '.join(failed)}" if failed else ""), flush=True)
     return 1 if failed else 0
 
 
 def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
     p = oracle_sub.add_parser("world", help="BlueMap's webapp vs real-client screenshots of scene worlds, per block face")
-    p.add_argument("--variant", default="default", choices=variants.NAMES, help="client/pack variant (default %(default)s)")
+    p.add_argument("--variant", action="append", choices=variants.NAMES,
+                   help="client/pack variant (repeatable, default: default)")
     p.add_argument("--scene", action="append", help="scene (repeatable)")
+    p.add_argument("--all", action="store_true",
+                   help="every scene with oracle cameras and a dump that fits the variant (addons-* scenes: addons); "
+                        "with --scene only those of them, the others skipped")
     p.add_argument("--rejudge", action="store_true",
-                   help="judge the existing report.json of each --scene again (current calibration and accepted.yaml) "
-                        "without capturing or rendering; vanilla-zoo of the default variant recalibrates")
+                   help="judge the existing report.json of each --scene again (current metrics, calibration and "
+                        "accepted.yaml) without capturing or rendering")
     p.add_argument("--report-dir", type=Path, action="append",
                    help="rejudge the report.json in this directory (a copy of a scene directory; repeatable)")
-    p.add_argument("--capture", choices=("auto", "always", "never"), default="auto",
-                   help="reference capture with gtnh-client cameras: when missing or the cameras changed (auto), "
-                        "always, or never (default %(default)s)")
+    p.add_argument("--recapture", action="store_true",
+                   help="capture the references with the client even if they are cached")
+    p.add_argument("--no-capture", action="store_true",
+                   help="never launch a client: scenes without a cached reference use their existing client/ "
+                        "captures (reported as stale) or fail")
+    p.add_argument("--recalibrate", action="store_true",
+                   help=f"calibrate the thresholds again ({CALIBRATION_VARIANT}/{CALIBRATION_SCENE} must be in the run) "
+                        f"instead of reusing the calibration stored for the current references")
+    p.add_argument("--parallel", type=int, help="client instances for the reference captures (gtnh-client --parallel)")
     p.add_argument("--mod-jar", type=Path, help="exporter jar for the reference capture (default: the launcher builds it)")
     p.add_argument("--no-build", action="store_true", help="use the existing BlueMap CLI/addon jars")
     p.set_defaults(func=cmd_world)

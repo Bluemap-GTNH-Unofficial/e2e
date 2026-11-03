@@ -45,7 +45,8 @@ default (also `$BMGTNH_PACK_VERSION`). It selects the per-version directories (`
 | `run` outputs / baselines | `out/e2e-2.9.0/`, `baselines-2.9.0/` |
 | exported packs (`{export}`, `{addons_export}`) | `out/exporter-2.9.0/bluemap-gtnh-resources-2.9.0.zip`, `out/exporter-addons-2.9.0/…-2.9.0-addons.zip` |
 | oracle outputs | `out/oracle-2.9.0/<variant>/` |
-| clients / servers (ports) | `clients/gtnh-2.9.0`, `servers/gtnh-2.9.0` (25569/25579), `gtnh-addons-2.9.0` (25572/25582) |
+| oracle reference cache (client captures, calibrations) | `out/oracle-ref/2.9.0/` |
+| clients | `clients/gtnh-2.9.0`, `clients/gtnh-modernity-2.9.0`, `clients/gtnh-addons-2.9.0` |
 
 The BlueMap build log and the Minecraft client jar cache are version-independent, in `out/e2e/`.
 
@@ -61,7 +62,7 @@ uv run --group dev pytest             # unit tests + one e2e test per scene view
 uv run --group dev pytest -m "not e2e"                         # unit tests only (seconds)
 uv run --group dev pytest --scene vanilla-zoo --no-build       # e2e for one scene, existing jars
 uv run e2e oracle world --scene vanilla-zoo   # world oracle: BlueMap vs the real client (see below)
-uv run e2e oracle world --variant modernity --scene gtnh-zoo --capture always --no-build
+uv run e2e oracle world --variant default --variant modernity --all --no-build   # every scene, both variants
 ```
 
 ## What `run` does per scene
@@ -155,15 +156,19 @@ machines included) with the real GTNH client drawing the same state in isolation
 `<workspace>/out/oracle-2.9.0/<variant>/states/` and are never committed (they hold Mojang and mod textures).
 
 ```bash
-cd ../gtnh-exporter/launcher && uv run gtnh-client states                 # reference: client/ (about 70 s)
-cd ../../e2e && uv run e2e oracle states --variant default                # BlueMap side, compare, report (about 100 s)
-# modernity: gtnh-client states --variant modernity --client-dir ../../clients/gtnh-modernity-2.9.0 \
-#   --resource-pack <Modernity zip> --extra-mod <MyCTMLib jar>, then e2e oracle states --variant modernity
+uv run e2e oracle states --variant default     # reference (cached, or gtnh-client states), BlueMap side, compare, report
+uv run e2e oracle states --variant modernity   # the variant's client, packs and mods are passed to gtnh-client
+uv run e2e oracle states --variant default --recapture   # capture the reference again although it is cached
 ```
 
 1. **Reference** (`client/`, exporter mod mode `states`, see the exporter and launcher READMEs): each state alone in
    a single-block world, drawn by the client's own `RenderBlocks.renderBlockByRenderType` (passes 0/1) and its
-   tile-entity special renderer, into an offscreen framebuffer.
+   tile-entity special renderer, into an offscreen framebuffer. `client/` links to the reference cache (see
+   "Reference cache" below); on a miss `e2e oracle states` runs `gtnh-client states` (about 70 s) with the variant's
+   client directory, `--resource-pack`, `--extra-mod` and `--states-from` (the variant's export), and checks that the
+   launcher's `states.txt` is the state list the key was computed from. `--no-capture` never launches the client
+   (without a cached reference the existing `client/` is compared and reported stale); `--parallel N` and
+   `--mod-jar` go to the launcher.
 2. **BlueMap** (`bluemap/`, fork module `oracle`, `./gradlew :oracle:renderStates`): the state placed at
    (0, 64, 0) of a synthetic 1.7.10 chunk read by the real legacy chunk loader and flattening, with the client's
    tile-entity NBT, rendered by every BlueMap render pass with the variant's packs (loaded like the server mod:
@@ -191,7 +196,10 @@ cd ../../e2e && uv run e2e oracle states --variant default                # Blue
    states whose client render threw.
 7. **Calibration**: the full runs of variant `default` classify every vanilla state against 1.7.10
    (`src/e2e/oracle/vanilla.py`, written to `out/oracle-2.9.0/default/states/vanilla.json`; other variants and the world
-   oracle read it) and the first one (or `--recalibrate`) writes `out/oracle-2.9.0/default/states/calibration.json`.
+   oracle read it). The thresholds are computed once per state reference of the default variant and stored in the
+   reference cache (`out/oracle-ref/2.9.0/calibration/states-<key>.json`, keyed by that reference's key); later runs
+   reuse them until the reference changes or `--recalibrate`. `out/oracle-2.9.0/default/states/calibration.json` is
+   the active copy every variant and the swap test read.
    BlueMap draws vanilla blocks from the 1.13 client jar, so the thresholds are calibrated only on vanilla states
    that look the same in both versions, decided from data:
    - **textures**: every texture of the 1.13 models BlueMap draws the state with is pixel-identical (frame 0) to the
@@ -259,17 +267,27 @@ webapp's own shaders are checked against the game itself. Everything it writes g
 `<workspace>/out/oracle-2.9.0/<variant>/worlds/<scene>/` and is never committed (it holds Mojang and mod textures).
 
 ```bash
-uv run e2e oracle world --variant default --scene vanilla-zoo [--scene ...] [--capture auto|always|never] [--mod-jar JAR] [--no-build]
+uv run e2e oracle world --variant default --scene vanilla-zoo [--scene ...] [--mod-jar JAR] [--no-build]
+uv run e2e oracle world --variant default --variant modernity --all [--parallel N]   # every scene of both variants
+uv run e2e oracle world --variant default --scene gtnh-zoo --recapture    # capture the reference again
+uv run e2e oracle world --variant default --all --no-capture              # never launch a client (BlueMap side only)
 uv run e2e oracle world --variant default --rejudge --scene vanilla-zoo --scene gtnh-zoo   # judge existing reports again
 uv run e2e oracle world --variant modernity --report-dir <copy of a scene directory>       # e.g. a saved earlier run
 ```
 
+`--variant` and `--scene` repeat; `--all` takes every scene with oracle cameras and a dump
+(`out/scenes-2.9.0/<scene>/dump.ndjson`) that fits the variant: scenes on the addons export (`addons-*`) for
+`addons`, the others (7 on 2.9.0) for `default` and `modernity`. `--all --scene a --scene b` restricts that set to
+`a` and `b` and only prints the scenes that are not in it.
+
 Variants (`src/e2e/oracle/variants.py`, directories with the `-2.9.0` suffix): `default` (client `clients/gtnh-2.9.0`,
-server `gtnh-2.9.0`, BlueMap with the default export), `modernity` (client `clients/gtnh-modernity-2.9.0` with the
-Modernity release zip and its MyCTMLib jar for the run; BlueMap with the default export and both `modernity` packs
-of that version from `out/modernity/`), `addons` (client `clients/gtnh-addons-2.9.0` with the jars listed for 2.9.0
-in `downloads/addons/versions.json`: 5 addons plus GTNLLib, which GT: Not Leisure requires; server
-`gtnh-addons-2.9.0`, BlueMap with the addons export).
+BlueMap with the default export), `modernity` (client `clients/gtnh-modernity-2.9.0` with the Modernity release zip
+and its MyCTMLib jar for the run; BlueMap with the default export and both `modernity` packs of that version from
+`out/modernity/`), `addons` (client `clients/gtnh-addons-2.9.0` with the jars listed for 2.9.0 in
+`downloads/addons/versions.json`: 5 addons plus GTNLLib, which GT: Not Leisure requires; BlueMap with the addons
+export).
+
+A run first resolves every scene's reference (below), then renders and judges per variant.
 
 Per scene:
 
@@ -278,21 +296,28 @@ Per scene:
    `remove` the dump cells of `oracle.exclude` states. Their faces are never judged (BlueMap still draws them; where
    they hide a neighbour, the occlusion rule of step 6 keeps that from counting); the report lists them under
    `excluded`.
-2. **Reference.** With `--capture auto` (default) when a camera has no capture or the camera list or `remove`
-   changed: `gtnh-client cameras` in the sibling `gtnh-exporter/launcher` (see its README) restores the scene world
-   on the variant's server, turns random ticks off, sets the `remove` cells to air, joins it with the client and
-   writes `client/<view>.{png,depth.bin,json}` (colour, depth buffer, projection and modelview matrices, eye
-   position). Log: `client.log`.
-3. **BlueMap.** Renders the scene world with the BlueMap CLI and the variant's packs (`bluemap/config`, `packs.txt`),
-   serves it and captures each camera in headless Chromium (`src/e2e/oracle/webapp.py`): MSAA off; map controls
-   detached and the three.js camera set to the client's eye, orientation and projection matrix; hires tiles loaded
+2. **Reference.** `client/` links to the scene's capture in the reference cache (see "Reference cache" below). The
+   misses of all requested scenes are captured first, with one `gtnh-client cameras --jobs <jobs.json>` per variant
+   in the sibling `gtnh-exporter/launcher` (see its README; `--parallel N` and `--mod-jar` are passed on): the client
+   opens each scene's world snapshot as a single-player save, turns random ticks off, sets the `remove` cells to air
+   and writes `<view>.{png,depth.bin,json}` (colour, depth buffer, projection and modelview matrices, eye position)
+   and `cameras-report.json`. A scene whose capture is incomplete is compared on the cameras that were captured but
+   not cached. `reference.json` records the key, whether it was cached and the launcher log
+   (`out/oracle-ref/2.9.0/logs/`); the report has it under `reference`.
+3. **BlueMap.** One BlueMap CLI process per variant renders every scene of the run with the variant's packs, one map
+   per scene (map id = scene name with `-` as `_`, BlueMap's own rule; `worlds/_bluemap/`: config, data, web,
+   `bluemap.log`; scene folders keep `bluemap/packs.txt`), and serves them while each camera is captured in headless
+   Chromium (`src/e2e/oracle/webapp.py`): MSAA off; map controls detached and the three.js camera set to the
+   client's eye, orientation and projection matrix; hires tiles loaded
    around the area the client shows; the capture conditions of the client: full brightness (`ambientLight` and
    `sunlightStrength` 1), no ambient occlusion and Minecraft's flat face shade (up 1.0, down 0.5, north/south 0.8,
    west/east 0.6; BlueMap's own directional light is 1.0 / 0.4 / 0.82 / 0.64; vertical diagonal faces such as cross
    plants unshaded like the client's crossed squares, with a tolerance of 0.02 on the normal components because
    BlueMap's normals of a 45 degree rotated element are not exactly diagonal), no mipmaps, animations at frame 0.
    The colour frame is read from the WebGL buffer once two consecutive frames are identical; a second pass writes
-   the hires surfaces' view-space depth (`bluemap/<view>.png`, `bluemap/<view>.depth.bin`).
+   the hires surfaces' view-space depth (`bluemap/<view>.png`, `bluemap/<view>.depth.bin`). Rendering the 7 scenes in
+   one process takes 21.0 s instead of 46.5 s for 7 processes with the default packs, 22.3 s instead of 52.0 s with
+   Modernity's (JVM start and resource loading once; measured 2026-11-02).
 4. **Faces** (`src/e2e/oracle/faces.py`). Both renderings are labelled per pixel from their own depth and the client's
    matrices: the block cell the visible surface lies in (a hit point within the depth error of a block plane belongs
    to the cell beyond it, others are pushed a little along the ray) and the cell face the view ray enters it through.
@@ -315,19 +340,25 @@ Per scene:
 7. **Thresholds** come from Tukey's far-out fences (k = 3) over the inexact samples of the `vanilla-zoo` faces
    (default variant, every face with at least 64 pixels in an aligned view) whose states look the same in 1.7.10 and
    1.13: IoU over the faces of the `geometry` set, delta E and SSIM over the `texture` set with one sample per block
-   (its worst inexact face) of `vanilla.json` (state oracle, step
-   7 above; run `oracle states --variant default` first). That run writes `out/oracle-2.9.0/default/worlds/calibration.json`
-   with the distributions and the calibration faces the thresholds fail; every other run reads it, so run
-   vanilla-zoo first. Faces of states `oracle/accepted.yaml` names (where the data backs the reason) are reported as
-   `accepted (1.13)` and counted apart.
-8. **Report.** `report.json` (every face: block, mod, metrics, failed criteria, a first guess at the cause, accepted),
+   (its worst inexact face) of `vanilla.json` (state oracle, step 7 above; run `oracle states --variant default`
+   first). The calibration is an artifact of the references it is computed from: vanilla-zoo's world reference key
+   and the default variant's state reference key (`out/oracle-ref/2.9.0/calibration/world-<key>.json`, with the
+   distributions and the calibration faces the thresholds fail). A run reuses the stored calibration while both keys
+   are unchanged, also when BlueMap changed; otherwise, or with `--recalibrate`, vanilla-zoo of the default variant
+   must be part of the run (it is judged first) and calibrates. `out/oracle-2.9.0/default/worlds/calibration.json` is
+   the active copy the other scenes, the reports and the swap test read. Faces of states `oracle/accepted.yaml`
+   names (where the data backs the reason) are reported as `accepted (1.13)` and counted apart.
+8. **Report.** `report.json` (every face: block, mod, metrics, failed criteria, a first guess at the cause, accepted;
+   `reference`; `timings`: `reference_capture` (client seconds, captured in this run only), `bluemap_render` (the
+   variant's shared render, `bluemap_batch` lists its scenes), `total` (this scene's views, comparison and report)),
    `report.html` (views side by side: client, BlueMap, difference, label agreement; per-mod pass rates; the worst
    faces by mod with crops in `report/crops/`), and `../summary.json` over the variant's scenes. Exit code 1 if a
-   view failed the alignment check. `--rejudge` (with `--scene`) or `--report-dir` judge an existing `report.json`
-   again without capturing or rendering: the face metrics are recomputed from the saved captures
-   (`client/<view>.*`, `bluemap/<view>.png`, `bluemap/<view>.depth.bin`) with the current metrics, calibration and
-   `accepted.yaml` (views without a saved BlueMap depth keep their stored metrics and are listed under
-   `stored_metric_views`); rejudging vanilla-zoo of the default variant in its scene directory recalibrates.
+   view failed the alignment check or a scene had no reference. `--rejudge` (with `--scene`) or `--report-dir` judge
+   an existing `report.json` again without capturing or rendering: the face metrics are recomputed from the saved
+   captures (`client/<view>.*`, `bluemap/<view>.png`, `bluemap/<view>.depth.bin`) with the current metrics, active
+   calibration and `accepted.yaml` (views without a saved BlueMap depth keep their stored metrics and are listed
+   under `stored_metric_views`); `--rejudge --recalibrate --variant default --scene vanilla-zoo` calibrates again
+   from the rejudged faces (stored for the references in its `reference.json`).
 
 `uv run e2e oracle world-swap-test [--scene ...] [--before <old calibration.json>]` (`src/e2e/oracle/world_swap.py`)
 measures how well the world thresholds discriminate: per scene (vanilla-zoo, gt-multiblocks and gtnh-zoo by
@@ -338,3 +369,53 @@ captures over the face's pixels at least 1): every one of them looks different i
 flagged is the detection rate, also reported by the size of the client difference. Faces whose two client captures
 agree (difference below 0.25) should still pass; the share that fails is the swap's false-failure rate. Writes
 `out/oracle-2.9.0/default/worlds/swap-test.json`.
+
+The swap tests only run on request; they read the active calibrations.
+
+## Reference cache
+
+The real client's captures only depend on what the client sees, so both oracles keep them in a content-addressed
+cache (`src/e2e/oracle/reference.py`, `<workspace>/out/oracle-ref/2.9.0/`, never committed) and launch a client only
+for inputs that have no capture yet. Day to day only the BlueMap side runs.
+
+The key is the SHA-256 of a canonical JSON of:
+
+| Input | World reference | State reference |
+|---|---|---|
+| pack version | yes | yes |
+| capture-settings version of the launcher: `CAPTURE_VERSION` in `gtnh_client/cameras.py`, `STATES_CAPTURE_VERSION` in `gtnh_client/states.py` (read from the source; the launcher bumps them when capture conditions, the exporter mod's capture code or anything else that changes the client's pixels changes; the exporter jar itself is not hashed) | yes | yes |
+| client mods: `.minecraft/mods/*.{jar,zip}` and `mods/1.7.10/*` of the variant's client directory (name and SHA-256, without `bluemap-gtnh-exporter*.jar`), the variant's extra mods and resource packs (name, SHA-256, order) | yes | yes |
+| harness mod the launcher loads into the client: the newest `servers/gtnh-2.9.0/mods/bmh-*.jar` | yes | - |
+| scene content: every non-air block of `out/scenes-2.9.0/<scene>/dump.ndjson` as position, name, meta and tile entity (canonical JSON), sorted; not the file time, line order or numeric block ids, so a rebuilt scene with the same blocks hits | yes | - |
+| `cameras.json`: cameras, dump box, world name, `remove` cells | yes | - |
+| state list: the flattening table's vanilla states, then the variant's export's `gtnh/blocks.ndjson` states (checked against the launcher's `states.txt` after a capture) | - | yes |
+
+A tile entity's counters (`mTotalRunTime`, `mLastWorkingTick`, ...) are part of the scene content: a rebuild that
+ticks machines differently is a new reference. The client's `config/` is not part of the key: after changing it, run
+with `--recapture`.
+
+```
+out/oracle-ref/2.9.0/
+  <variant>/<scene>/<key>/       <view>.png, .depth.bin, .json, cameras-report.json, key.json (all inputs)
+  <variant>/states/<key>/        client/ (index.json, images), states.txt, key.json
+  <...>/<key>.partial/           staging of a capture in progress or of one that failed
+  calibration/world-<key>.json   world thresholds, keyed by vanilla-zoo's and the default state reference's keys
+  calibration/states-<key>.json  state thresholds, keyed by the default state reference's key
+  logs/                          launcher logs and the jobs.json of each batch
+  hashes.json                    SHA-256 memo by path, size and mtime (only saves re-reading unchanged jars)
+```
+
+`<key>` is the first 16 hex digits. A capture is staged in `<key>.partial/` and renamed to `<key>/` only when the
+launcher reports every camera (state) captured with the expected capture version; entries are read-only and never
+change afterwards. `worlds/<scene>/client` and `states/client` are symlinks to the entry in use; `reference.json`
+next to them records its key. A miss prints which inputs differ from the newest entry of the same scene. Delete
+`out/oracle-ref/` (or an entry) to drop captures; `--recapture` replaces an entry.
+
+Client runs are serialised by the launcher's lock `<workspace>/locks/client.lock` (see the launcher README): a second
+`oracle world` that needs the client while another one holds it waits and prints the holder.
+
+Unit tests: `tests/test_oracle_reference.py` (key stability: same content with other timestamps, line order and ids
+gives the same key, every input change gives another; hits, misses, partial captures, one batch per variant and
+`--no-capture` with a fake launcher, `tests/fake_gtnh_client.py`; state references; calibration reuse) and
+`tests/test_oracle_states.py` (state calibration keyed by the reference).
+

@@ -25,10 +25,6 @@ class Pack:
 
     version: str
     suffix: str
-    server_port: int  # ports the oracle runs the pack's scene servers on
-    rcon_port: int
-    addon_server_port: int
-    addon_rcon_port: int
 
     def dir(self, base: str) -> Path:
         """``<workspace>/<base><suffix>``, e.g. ``out/scenes-2.9.0``."""
@@ -44,11 +40,6 @@ class Pack:
         return f"gtnh-{self.version}"
 
     @property
-    def addon_server(self) -> str:
-        """Directory under ``<workspace>/servers`` with the pack plus the community addons."""
-        return f"gtnh-addons{self.suffix}"
-
-    @property
     def export(self) -> Path:
         """The exporter's resource pack of the plain pack (``gtnh-client export``)."""
         return self.dir("out/exporter") / f"bluemap-gtnh-resources-{self.version}.zip"
@@ -61,7 +52,7 @@ class Pack:
 
 # add a version here (and to the orchestrator's and launcher's tables) to test it
 PACKS = {
-    "2.9.0": Pack("2.9.0", "-2.9.0", 25569, 25579, 25572, 25582),
+    "2.9.0": Pack("2.9.0", "-2.9.0"),
 }
 
 

@@ -36,10 +36,12 @@ def test_workspace_layout(workspace: Path) -> None:
 
 def test_variants(workspace: Path) -> None:
     default = variants.load("default")
-    assert (default.client_dir, default.server, default.server_port, default.rcon_port) == (
-        workspace / "clients" / "gtnh-2.9.0", "gtnh-2.9.0", 25569, 25579)
+    export = workspace / "out" / "exporter-2.9.0" / "bluemap-gtnh-resources-2.9.0.zip"
+    assert (default.client_dir, default.states_from) == (workspace / "clients" / "gtnh-2.9.0", export)
     assert variants.oracle_dir(default) == workspace / "out" / "oracle-2.9.0" / "default"
-    assert variants.load("modernity").client_dir == workspace / "clients" / "gtnh-modernity-2.9.0"
+    modernity = variants.load("modernity")
+    assert (modernity.client_dir, modernity.states_from) == (workspace / "clients" / "gtnh-modernity-2.9.0", export)
     addons = variants.load("addons")
-    assert (addons.client_dir, addons.server, addons.server_port) == (
-        workspace / "clients" / "gtnh-addons-2.9.0", "gtnh-addons-2.9.0", 25572)
+    assert (addons.client_dir, addons.states_from) == (
+        workspace / "clients" / "gtnh-addons-2.9.0",
+        workspace / "out" / "exporter-addons-2.9.0" / "bluemap-gtnh-resources-2.9.0-addons.zip")
