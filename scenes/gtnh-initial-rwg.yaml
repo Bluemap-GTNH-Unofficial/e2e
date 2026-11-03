@@ -1,7 +1,7 @@
-# Initial GTNH realistic-world-gen overworld (copied from the server pack's first boot): 576 populated chunks,
-# hires tiles x -9..1, z -4..6 (blocks about x -286..66, z -126..226).
+# Initial GTNH realistic-world-gen overworld (first boot of the server pack, seed 1710, spawn -109, -65): the spawn
+# area's populated chunks around the spawn.
 world: gtnh-initial-rwg
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:
@@ -12,12 +12,12 @@ defaults:
 
 views:
   overview-flat:          # all populated terrain from above
-    position: [-110, 64, 50]
+    position: [-123, 64, -90]
     distance: 250
     mode: flat
     ortho: 1
   overview-perspective:   # terrain relief, 50 degrees down
-    position: [-110, 64, 50]
+    position: [-123, 64, -90]
     distance: 300
     rotation: 0.6
     angle: 0.9

@@ -5,7 +5,7 @@
 # The zoo also places metas the addons never use (TST MetaBlock01 1..15, SpaceTime* 3..15, ...: damageDropped(m) == m
 # but no icon), which render as missing cubes.
 world: addons-zoo
-extra_packs: [out/exporter-addons/bluemap-gtnh-resources-2.9.0-RC-2-addons.zip]
+extra_packs: ["{addons_export}"]
 viewport: [1280, 720]
 
 defaults:

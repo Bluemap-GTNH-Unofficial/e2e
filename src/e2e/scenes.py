@@ -52,6 +52,13 @@ class Scene:
     extra_packs: tuple[Path, ...] = ()
 
 
+def pack_path(entry: str) -> Path:
+    """An ``extra_packs`` entry: ``{export}`` / ``{addons_export}`` (the exporter's packs of the selected pack
+    version, ``paths.Pack``) or a workspace-relative path."""
+    pack = paths.pack()
+    return paths.workspace() / entry.format(export=pack.export, addons_export=pack.addons_export)
+
+
 def names() -> list[str]:
     return sorted(p.stem for p in paths.SCENES_DIR.glob("*.yaml"))
 
@@ -76,7 +83,7 @@ def load(name: str) -> Scene:
     views = tuple(_view(view_name, view, defaults) for view_name, view in raw["views"].items())
     maps = raw.get("maps")
     width, height = raw.get("viewport", (1280, 720))
-    packs = tuple(paths.workspace() / p for p in raw.get("extra_packs", []))
+    packs = tuple(pack_path(p) for p in raw.get("extra_packs", []))
     return Scene(
         name=name,
         world=paths.worlds_dir() / raw.get("world", name),

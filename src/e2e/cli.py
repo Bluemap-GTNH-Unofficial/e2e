@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -69,6 +70,9 @@ def cmd_list(_: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="e2e", description=__doc__)
+    parser.add_argument("--pack-version", choices=list(paths.PACKS),
+                        help="GTNH pack version whose worlds, scene outputs, exports, clients and servers are used "
+                             f"(default: $BMGTNH_PACK_VERSION, else {paths.DEFAULT_PACK_VERSION})")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="render scenes, capture views, compare with baselines")
@@ -88,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     oracle_cli.register(sub)
 
     args = parser.parse_args(argv)
+    if args.pack_version:
+        os.environ["BMGTNH_PACK_VERSION"] = args.pack_version  # paths.pack(); inherited by gtnh-client and orch
     return args.func(args)
 
 

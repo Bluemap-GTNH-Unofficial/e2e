@@ -78,9 +78,10 @@ class Block:
 
 
 def load_dump(scene: str) -> dict[tuple[int, int, int], Block]:
-    path = paths.workspace() / "out" / "scenes" / scene / "dump.ndjson"
+    path = paths.scenes_dir() / scene / "dump.ndjson"
     if not path.is_file():
-        raise FileNotFoundError(f"{path} does not exist; build the scene with `uv run orch scene {scene}`")
+        raise FileNotFoundError(f"{path} does not exist; build the scene with "
+                                f"`uv run orch --pack-version {paths.pack().version} scene {scene}`")  # fmt: skip
     blocks = {}
     with path.open(encoding="utf-8") as lines:
         for line in lines:
@@ -113,9 +114,10 @@ def capture_reference(variant: variants.Variant, scene: str, cameras_file: Path,
                       mod_jar: Path | None) -> float:
     """Runs `gtnh-client cameras` in the sibling launcher checkout; returns its wall time."""
     launcher = paths.workspace() / "gtnh-exporter" / "launcher"
-    cmd = ["uv", "run", "gtnh-client", "cameras", "--scene", scene, "--variant", variant.name,
-           "--cameras", str(cameras_file), "--out", str(client_dir), "--client-dir", str(variant.client_dir),
-           "--server-dir", variant.server, "--port", str(variant.server_port), "--rcon-port", str(variant.rcon_port)]
+    cmd = ["uv", "run", "gtnh-client", "cameras", "--pack-version", variant.pack.version, "--scene", scene,
+           "--variant", variant.name, "--cameras", str(cameras_file), "--out", str(client_dir),
+           "--client-dir", str(variant.client_dir), "--server-dir", variant.server, "--port", str(variant.server_port),
+           "--rcon-port", str(variant.rcon_port)]  # fmt: skip
     cmd += [f"--resource-pack={p}" for p in variant.resource_packs]
     cmd += [f"--extra-mod={m}" for m in variant.extra_mods]
     if mod_jar:

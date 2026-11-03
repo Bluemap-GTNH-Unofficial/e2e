@@ -4,7 +4,7 @@
 # Tiles touching the ungenerated chunk column x 96..111 (hires tiles x >= 64) are not rendered by BlueMap
 # (TileState.NOT_GENERATED), so the west list and the east end of the north list stay empty.
 world: gt-machines
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

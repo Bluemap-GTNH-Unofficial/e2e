@@ -15,7 +15,7 @@
 # beam formers facing each other x 48 z -64 / -58, GTNL ender elevator meta 14 x 60, fumo meta 5 x 68, player doll
 # meta 3 x 76, Box++ ring 1 switched on (3 rings, scale 0.3) x 100.
 world: addons-multiblocks
-extra_packs: [out/exporter-addons/bluemap-gtnh-resources-2.9.0-RC-2-addons.zip]
+extra_packs: ["{addons_export}"]
 viewport: [1280, 720]
 
 defaults:

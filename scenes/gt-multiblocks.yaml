@@ -2,7 +2,7 @@
 # controllers at x = 0, 48, ..., 864, y=20, z=0, all facing north, structures extending south; the superflat ground is
 # at y=4, so the structures float. Controllers and hatches: gtnh:gt_machine; casings: exporter models.
 world: gt-multiblocks
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

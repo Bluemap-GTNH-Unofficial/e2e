@@ -15,8 +15,9 @@ serves it, opens camera views in headless Chromium, and compares screenshots wit
 The baselines are a BlueMap-vs-BlueMap regression check only: they show that a render did not change since it was
 approved by eye, not that it is correct. Correctness comes from the oracle (`uv run e2e oracle ...`, in progress),
 which compares against the real GTNH client. Baselines contain Minecraft and mod textures, so they are never committed:
-they live in `<workspace>/baselines/<scene>/<view>.png` (override with `BMGTNH_BASELINES`) and are regenerated on
-demand. `e2e run` fails a view that has no baseline; review its screenshot in `<workspace>/out/e2e/<scene>/shots/` and
+they live in `<workspace>/baselines-2.9.0/<scene>/<view>.png` (per pack version, see below; override with
+`BMGTNH_BASELINES`) and are regenerated on demand. `e2e run` fails a view that has no baseline; review its screenshot
+in `<workspace>/out/e2e-2.9.0/<scene>/shots/` and
 then run `uv run e2e approve <scene> [view...]`.
 
 ## Setup
@@ -27,9 +28,25 @@ uv run playwright install chromium   # once per machine (~100 MB, ~/Library/Cach
 ```
 
 Scene worlds come from the orchestrator (`uv run orch scene vanilla-zoo` etc. in the sibling `orchestrator/` checkout)
-and live in `<workspace>/worlds/<scene>/`. The workspace defaults to the parent of this `e2e/` checkout; the BlueMap
-fork is expected next to it in `<workspace>/BlueMap`. Override the workspace with `BMGTNH_WORKSPACE`. Java:
+and live in `<workspace>/worlds-2.9.0/<scene>/`. The workspace defaults to the parent of this `e2e/` checkout; the
+BlueMap fork is expected next to it in `<workspace>/BlueMap`. Override the workspace with `BMGTNH_WORKSPACE`. Java:
 `mise where java@temurin-25.0.5+8.0.LTS`, override with `BMGTNH_JAVA=/path/to/java`.
+
+**Pack versions.** Every command works on one GTNH pack version: `uv run e2e --pack-version 2.9.0-RC-2 <command>`
+(a root option, before the command; it sets `BMGTNH_PACK_VERSION` for `gtnh-client` and `orch` too), default
+`$BMGTNH_PACK_VERSION`, else `2.9.0`. It selects the per-version directories (`src/e2e/paths.py`), which end in
+`-<version>`; 2.9.0-RC-2, the first version tested, keeps the unversioned ones:
+
+| | 2.9.0 (default) | 2.9.0-RC-2 |
+|---|---|---|
+| scene worlds / orchestrator outputs | `worlds-2.9.0/`, `out/scenes-2.9.0/` | `worlds/`, `out/scenes/` |
+| `run` outputs / baselines | `out/e2e-2.9.0/`, `baselines-2.9.0/` | `out/e2e/`, `baselines/` |
+| exported packs (`{export}`, `{addons_export}`) | `out/exporter-2.9.0/bluemap-gtnh-resources-2.9.0.zip`, `out/exporter-addons-2.9.0/…-2.9.0-addons.zip` | `out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip`, `out/exporter-addons/…-2.9.0-RC-2-addons.zip` |
+| oracle outputs | `out/oracle-2.9.0/<variant>/` | `out/oracle/<variant>/` |
+| clients / servers (ports) | `clients/gtnh-2.9.0`, `servers/gtnh-2.9.0` (25569/25579), `gtnh-addons-2.9.0` (25572/25582) | `clients/gtnh-2.9.0-RC-2`, `servers/gtnh-2.9.0-RC-2` (25565/25575), `gtnh-addons` (25568/25578) |
+
+The BlueMap build log and the Minecraft client jar cache stay in `out/e2e/` for both versions. Paths below are
+written for 2.9.0.
 
 ## Commands
 
@@ -37,13 +54,14 @@ fork is expected next to it in `<workspace>/BlueMap`. Override the workspace wit
 uv run e2e run [scene...]            # all scenes by default; exit code 1 if any check fails
 uv run e2e run vanilla-zoo --no-build   # reuse the jars already built
 uv run e2e run gtnh-zoo --packs /path/to/exported-packs   # extra resource packs (file, or directory of packs)
-uv run e2e approve <scene> [view...]  # copy the latest screenshots to <workspace>/baselines/<scene>/<view>.png
+uv run e2e approve <scene> [view...]  # copy the latest screenshots to <workspace>/baselines-2.9.0/<scene>/<view>.png
 uv run e2e list                       # scenes, views and their URL hashes
 uv run --group dev pytest             # unit tests + one e2e test per scene view and per scene log
 uv run --group dev pytest -m "not e2e"                         # unit tests only (seconds)
 uv run --group dev pytest --scene vanilla-zoo --no-build       # e2e for one scene, existing jars
 uv run e2e oracle world --scene vanilla-zoo   # world oracle: BlueMap vs the real client (see below)
 uv run e2e oracle world --variant modernity --scene gtnh-zoo --capture always --no-build
+uv run e2e --pack-version 2.9.0-RC-2 run   # every scene on 2.9.0-RC-2 (worlds/, out/e2e/, baselines/)
 ```
 
 ## What `run` does per scene
@@ -52,7 +70,7 @@ uv run e2e oracle world --variant modernity --scene gtnh-zoo --capture always --
    `gtnh-render/build.gradle.kts` exists) in `<workspace>/BlueMap`, log in `out/e2e/build.log`. Then picks the newest
    `implementations/cli/build/libs/cli-*-shadow.jar` (refused unless it contains the webapp) and the newest
    `*-addon.jar` of each addon project.
-2. **Config.** Wipes `out/e2e/<scene>/` and writes `config/` there: `accept-download: true`, data and webroot
+2. **Config.** Wipes `out/e2e-2.9.0/<scene>/` and writes `config/` there: `accept-download: true`, data and webroot
    inside the scene folder, file storage, webserver on the first free port of `127.0.0.1:8200..8209`, addon jars and
    `--packs`/`extra_packs` in `config/packs/`, and one map per dimension that has a non-empty region file
    (ids `overworld`, `the_nether`, `the_end`, `dim_<n>`; loader `gtnh:anvil_1_7`). Downloaded Minecraft client jars
@@ -97,9 +115,10 @@ failed requests. A scene also fails on `ERROR` lines in `bluemap.log`.
 `scenes/<scene>.yaml`:
 
 ```yaml
-world: vanilla-zoo          # folder under <workspace>/worlds (default: the scene name)
+world: vanilla-zoo          # folder under the pack version's worlds directory (default: the scene name)
 maps: [overworld]           # optional subset of the auto-detected maps to render
-extra_packs: [out/packs]    # optional, relative to the workspace
+extra_packs: ["{export}"]   # optional: "{export}" / "{addons_export}" (the pack version's exported packs) or
+                            # paths relative to the workspace
 viewport: [1280, 720]
 defaults:                   # merged into every view
   map: overworld
@@ -125,20 +144,20 @@ oracle:                     # optional, world oracle cameras (see "World oracle"
     "Natura:Natura.workbench": [13, 14, 15]   # not judged (one such block blanks its whole chunk in the client)
 ```
 
-Baselines in `<workspace>/baselines/<scene>/` record the renderer state when they were approved; re-approve after
+Baselines in `<workspace>/baselines-2.9.0/<scene>/` record the renderer state when they were approved; re-approve after
 intentional rendering changes, after reviewing the new screenshots.
 
 ## State oracle (`oracle states`)
 
-Compares BlueMap's rendering of every block state the exporter knows (62,770 with the default pack: 1,191 vanilla
+Compares BlueMap's rendering of every block state the exporter knows (62,770 with the default pack on 2.9.0-RC-2: 1,191 vanilla
 states of Mojang's 1.13 flattening table plus every state of the pack's `gtnh/blocks.ndjson`, GregTech machines
 included) with the real GTNH client drawing the same state in isolation. Outputs go to
-`<workspace>/out/oracle/<variant>/states/` and are never committed (they hold Mojang and mod textures).
+`<workspace>/out/oracle-2.9.0/<variant>/states/` and are never committed (they hold Mojang and mod textures).
 
 ```bash
 cd ../gtnh-exporter/launcher && uv run gtnh-client states                 # reference: client/ (about 80 s)
 cd ../../e2e && uv run e2e oracle states --variant default                # BlueMap side, compare, report (about 90 s)
-# modernity: gtnh-client states --variant modernity --client-dir ../../clients/gtnh-modernity \
+# modernity: gtnh-client states --variant modernity --client-dir ../../clients/gtnh-modernity-2.9.0 \
 #   --resource-pack <Modernity zip> --extra-mod <MyCTMLib jar>, then e2e oracle states --variant modernity
 ```
 
@@ -171,8 +190,8 @@ cd ../../e2e && uv run e2e oracle states --variant default                # Blue
    draws nothing for in isolation while BlueMap draws something (upper halves, markings without support, ...), and
    states whose client render threw.
 7. **Calibration**: the full runs of variant `default` classify every vanilla state against 1.7.10
-   (`src/e2e/oracle/vanilla.py`, written to `out/oracle/default/states/vanilla.json`; other variants and the world
-   oracle read it) and the first one (or `--recalibrate`) writes `out/oracle/default/states/calibration.json`.
+   (`src/e2e/oracle/vanilla.py`, written to `out/oracle-2.9.0/default/states/vanilla.json`; other variants and the world
+   oracle read it) and the first one (or `--recalibrate`) writes `out/oracle-2.9.0/default/states/calibration.json`.
    BlueMap draws vanilla blocks from the 1.13 client jar, so the thresholds are calibrated only on vanilla states
    that look the same in both versions, decided from data:
    - **textures**: every texture of the 1.13 models BlueMap draws the state with is pixel-identical (frame 0) to the
@@ -221,7 +240,7 @@ cd ../../e2e && uv run e2e oracle states --variant default                # Blue
 Modernity client's render of every state is the reference and the default client's render the test, for the
 states whose two renders differ (mean absolute RGBA difference at least 1); every one of them looks different, so
 the share flagged is the detection rate. It also reports each threshold set's failures on the calibration sets
-(states that look the same), and writes `out/oracle/default/states/swap-test.json`.
+(states that look the same), and writes `out/oracle-2.9.0/default/states/swap-test.json`.
 
 The suspected causes in the report are heuristics from the metrics (silhouette, colour, brightness, texture
 pattern, BlueMap draws nothing or the missing model, tile-entity-only blocks); review the images before acting.
@@ -235,7 +254,7 @@ and report on synthetic renders and jars), `tests/test_oracle_accepted.py` (patt
 Compares BlueMap's webapp with screenshots of the real GTNH client at exactly the same camera, per visible block
 face, so neighbour-dependent appearance (connected textures, pipes, cables, multiblocks, stairs and fences) and the
 webapp's own shaders are checked against the game itself. Everything it writes goes to
-`<workspace>/out/oracle/<variant>/worlds/<scene>/` and is never committed (it holds Mojang and mod textures).
+`<workspace>/out/oracle-2.9.0/<variant>/worlds/<scene>/` and is never committed (it holds Mojang and mod textures).
 
 ```bash
 uv run e2e oracle world --variant default --scene vanilla-zoo [--scene ...] [--capture auto|always|never] [--mod-jar JAR] [--no-build]
@@ -243,10 +262,12 @@ uv run e2e oracle world --variant default --rejudge --scene vanilla-zoo --scene 
 uv run e2e oracle world --variant modernity --report-dir <copy of a scene directory>       # e.g. a saved earlier run
 ```
 
-Variants (`src/e2e/oracle/variants.py`): `default` (client `clients/gtnh-2.9.0-RC-2`, BlueMap with the default
-export), `modernity` (client `clients/gtnh-modernity` with the Modernity release zip and its MyCTMLib jar for the run;
-BlueMap with the default export and both `modernity` packs from `out/modernity/`), `addons` (client
-`clients/gtnh-addons` with the six addon jars, server `gtnh-addons`, BlueMap with the addons export).
+Variants (`src/e2e/oracle/variants.py`), per pack version (`[-<version>]`: `-2.9.0` on 2.9.0, nothing on 2.9.0-RC-2):
+`default` (client `clients/gtnh-<version>`, server `gtnh-<version>`, BlueMap with the default export), `modernity`
+(client `clients/gtnh-modernity[-<version>]` with the Modernity release zip and its MyCTMLib jar for the run; BlueMap
+with the default export and both `modernity` packs of that version from `out/modernity/`), `addons` (client
+`clients/gtnh-addons[-<version>]` with the addon jars of the version in `downloads/addons/versions.json`, 5 on 2.9.0
+and 6 on 2.9.0-RC-2, server `gtnh-addons[-<version>]`, BlueMap with the addons export).
 
 Per scene:
 
@@ -274,7 +295,7 @@ Per scene:
    matrices: the block cell the visible surface lies in (a hit point within the depth error of a block plane belongs
    to the cell beyond it, others are pushed a little along the ray) and the cell face the view ray enters it through.
    This equals projecting each dump block's six faces and keeping the parts the depth buffer shows, and also works
-   for non-cube blocks. Only cells of the scene's dump (`out/scenes/<scene>/dump.ndjson`) count.
+   for non-cube blocks. Only cells of the scene's dump (`out/scenes-2.9.0/<scene>/dump.ndjson`) count.
 5. **Alignment** before anything is trusted: the global shift of BlueMap's labels onto the client's (best of +-3 px,
    refined to sub-pixel) and the block-edge reprojection error (distance from every client edge pixel between two
    full-cube faces to the nearest BlueMap label edge). A view passes with |shift| <= 1 px, median edge error <= 1 px
@@ -293,7 +314,7 @@ Per scene:
    (default variant, every face with at least 64 pixels in an aligned view) whose states look the same in 1.7.10 and
    1.13: IoU over the faces of the `geometry` set, delta E and SSIM over the `texture` set with one sample per block
    (its worst inexact face) of `vanilla.json` (state oracle, step
-   7 above; run `oracle states --variant default` first). That run writes `out/oracle/default/worlds/calibration.json`
+   7 above; run `oracle states --variant default` first). That run writes `out/oracle-2.9.0/default/worlds/calibration.json`
    with the distributions and the calibration faces the thresholds fail; every other run reads it, so run
    vanilla-zoo first. Faces of states `oracle/accepted.yaml` names (where the data backs the reason) are reported as
    `accepted (1.13)` and counted apart.
@@ -314,4 +335,4 @@ variant's own report and that the two clients draw differently (mean absolute RG
 captures over the face's pixels at least 1): every one of them looks different in the reference client, so the share
 flagged is the detection rate, also reported by the size of the client difference. Faces whose two client captures
 agree (difference below 0.25) should still pass; the share that fails is the swap's false-failure rate. Writes
-`out/oracle/default/worlds/swap-test.json`.
+`out/oracle-2.9.0/default/worlds/swap-test.json`.

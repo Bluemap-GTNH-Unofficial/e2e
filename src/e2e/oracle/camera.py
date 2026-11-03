@@ -140,8 +140,9 @@ def is_excluded(states: dict[str, frozenset[int] | None], block: str, meta: int)
 
 
 def scene_box(name: str) -> list[int] | None:
-    """The scene's dump box ``[x0, y0, z0, x1, y1, z1]`` (inclusive) from ``out/scenes/<scene>/scene.json``."""
-    path = paths.workspace() / "out" / "scenes" / name / "scene.json"
+    """The scene's dump box ``[x0, y0, z0, x1, y1, z1]`` (inclusive) from the orchestrator's ``scene.json`` of the
+    selected pack version."""
+    path = paths.scenes_dir() / name / "scene.json"
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8")).get("dump_box")

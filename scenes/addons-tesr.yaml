@@ -3,7 +3,7 @@
 # y=5, z=-48, x = 0, 8, ..., 184; the active row (NBT set: beams on, rings shown, jar filled, paired beam formers) at
 # y=5, z=-64 (beam former partner at z=-58). Cameras north of the rows, looking south.
 world: addons-multiblocks
-extra_packs: [out/exporter-addons/bluemap-gtnh-resources-2.9.0-RC-2-addons.zip]
+extra_packs: ["{addons_export}"]
 viewport: [1280, 720]
 
 defaults:

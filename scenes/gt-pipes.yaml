@@ -2,7 +2,7 @@
 # x 0..106, z 0..102; junctions (5-block lines with branches) z 106..132; painted lines z 134..166.
 # Renderer gtnh:gt_machine (pipe geometry from thickness + mConnections).
 world: gt-pipes
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

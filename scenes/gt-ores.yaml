@@ -2,7 +2,7 @@
 # normal and small ore, on every stone type), gt.blockores3..7 in the last row z 120..122.
 # Renderer gtnh:gt_ore (stone background + tinted ore overlay by meta).
 world: gt-ores
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

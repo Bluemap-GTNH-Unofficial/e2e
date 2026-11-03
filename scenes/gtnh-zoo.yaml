@@ -1,7 +1,7 @@
 # Full GTNH block zoo (`orch scene gtnh-zoo`): superflat, 16642 blocks of every mod on a 2-block grid at y=4,
 # x 0..258, z 0..256, ordered by block id (vanilla first, near the origin).
 world: gtnh-zoo
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

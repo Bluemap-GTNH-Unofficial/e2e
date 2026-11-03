@@ -4,7 +4,7 @@
 # bundle line z 61..64; AE2 + EnderIO facades z 66..69. Renderers gtnh:chisel_ctm, gtnh:iron_chest, gtnh:bibliocraft, gtnh:ae2_cable_bus,
 # gtnh:enderio_conduit (gtnh-render mods/).
 world: mod-renderers
-extra_packs: [out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip]
+extra_packs: ["{export}"]
 viewport: [1280, 720]
 
 defaults:

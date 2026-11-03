@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from e2e import paths
 from e2e.oracle import states, vanilla, variants
 
 PALETTE = [0, 0, 0, 64, 64, 64, 255, 255, 255, 255, 0, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 255, 0, 255]
@@ -51,8 +52,9 @@ def _cube(texture: str) -> str:
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("BMGTNH_WORKSPACE", str(tmp_path))
-    (tmp_path / variants.DEFAULT_PACK).parent.mkdir(parents=True)
-    (tmp_path / variants.DEFAULT_PACK).write_bytes(b"")
+    monkeypatch.delenv("BMGTNH_PACK_VERSION", raising=False)
+    paths.pack().export.parent.mkdir(parents=True)
+    paths.pack().export.write_bytes(b"")
     # the 1.7.10 vs 1.13 sources (oracle.vanilla): `block` and `shifted` share a texture identical in both jars,
     # white wool differs
     src = vanilla.sources()
