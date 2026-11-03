@@ -13,12 +13,14 @@ Browser end-to-end checks of rendered BlueMap GTNH maps. For each scene it rende
 serves it, opens camera views in headless Chromium, and compares screenshots with locally approved baselines.
 
 The baselines are a BlueMap-vs-BlueMap regression check only: they show that a render did not change since it was
-approved by eye, not that it is correct. Correctness comes from the oracle (`uv run e2e oracle ...`, in progress),
-which compares against the real GTNH client. Baselines contain Minecraft and mod textures, so they are never committed:
-they live in `<workspace>/baselines-2.9.0/<scene>/<view>.png` (per pack version, see below; override with
-`BMGTNH_BASELINES`) and are regenerated on demand. `e2e run` fails a view that has no baseline; review its screenshot
-in `<workspace>/out/e2e-2.9.0/<scene>/shots/` and
-then run `uv run e2e approve <scene> [view...]`.
+approved by eye, not that it is correct. Correctness comes from the oracle, which compares BlueMap with the real GTNH
+client: every block state in isolation (`uv run e2e oracle states`) and scene worlds per visible block face
+(`uv run e2e oracle world`), see below. The results of the last full run are summarised in
+`<workspace>/out/oracle-2.9.0/SUMMARY.md` (not committed). Baselines contain Minecraft and mod textures, so they are
+never committed: they live in `<workspace>/baselines-2.9.0/<scene>/<view>.png` (currently 8 scenes, 50 views, all
+approved by eye; override with `BMGTNH_BASELINES`) and are regenerated on demand. `e2e run` fails a view that has no
+baseline; review its screenshot in `<workspace>/out/e2e-2.9.0/<scene>/shots/` and then run
+`uv run e2e approve <scene> [view...]`.
 
 ## Setup
 
@@ -32,21 +34,20 @@ and live in `<workspace>/worlds-2.9.0/<scene>/`. The workspace defaults to the p
 BlueMap fork is expected next to it in `<workspace>/BlueMap`. Override the workspace with `BMGTNH_WORKSPACE`. Java:
 `mise where java@temurin-25.0.5+8.0.LTS`, override with `BMGTNH_JAVA=/path/to/java`.
 
-**Pack versions.** Every command works on one GTNH pack version: `uv run e2e --pack-version 2.9.0-RC-2 <command>`
-(a root option, before the command; it sets `BMGTNH_PACK_VERSION` for `gtnh-client` and `orch` too), default
-`$BMGTNH_PACK_VERSION`, else `2.9.0`. It selects the per-version directories (`src/e2e/paths.py`), which end in
-`-<version>`; 2.9.0-RC-2, the first version tested, keeps the unversioned ones:
+**Pack version.** GTNH 2.9.0 is the only supported version. `uv run e2e --pack-version 2.9.0 <command>` (a root
+option, before the command; it sets `BMGTNH_PACK_VERSION` for `gtnh-client` and `orch` too) accepts only `2.9.0`, the
+default (also `$BMGTNH_PACK_VERSION`). It selects the per-version directories (`src/e2e/paths.py`), which end in
+`-2.9.0`:
 
-| | 2.9.0 (default) | 2.9.0-RC-2 |
-|---|---|---|
-| scene worlds / orchestrator outputs | `worlds-2.9.0/`, `out/scenes-2.9.0/` | `worlds/`, `out/scenes/` |
-| `run` outputs / baselines | `out/e2e-2.9.0/`, `baselines-2.9.0/` | `out/e2e/`, `baselines/` |
-| exported packs (`{export}`, `{addons_export}`) | `out/exporter-2.9.0/bluemap-gtnh-resources-2.9.0.zip`, `out/exporter-addons-2.9.0/…-2.9.0-addons.zip` | `out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip`, `out/exporter-addons/…-2.9.0-RC-2-addons.zip` |
-| oracle outputs | `out/oracle-2.9.0/<variant>/` | `out/oracle/<variant>/` |
-| clients / servers (ports) | `clients/gtnh-2.9.0`, `servers/gtnh-2.9.0` (25569/25579), `gtnh-addons-2.9.0` (25572/25582) | `clients/gtnh-2.9.0-RC-2`, `servers/gtnh-2.9.0-RC-2` (25565/25575), `gtnh-addons` (25568/25578) |
+| | 2.9.0 |
+|---|---|
+| scene worlds / orchestrator outputs | `worlds-2.9.0/`, `out/scenes-2.9.0/` |
+| `run` outputs / baselines | `out/e2e-2.9.0/`, `baselines-2.9.0/` |
+| exported packs (`{export}`, `{addons_export}`) | `out/exporter-2.9.0/bluemap-gtnh-resources-2.9.0.zip`, `out/exporter-addons-2.9.0/…-2.9.0-addons.zip` |
+| oracle outputs | `out/oracle-2.9.0/<variant>/` |
+| clients / servers (ports) | `clients/gtnh-2.9.0`, `servers/gtnh-2.9.0` (25569/25579), `gtnh-addons-2.9.0` (25572/25582) |
 
-The BlueMap build log and the Minecraft client jar cache stay in `out/e2e/` for both versions. Paths below are
-written for 2.9.0.
+The BlueMap build log and the Minecraft client jar cache are version-independent, in `out/e2e/`.
 
 ## Commands
 
@@ -61,7 +62,6 @@ uv run --group dev pytest -m "not e2e"                         # unit tests only
 uv run --group dev pytest --scene vanilla-zoo --no-build       # e2e for one scene, existing jars
 uv run e2e oracle world --scene vanilla-zoo   # world oracle: BlueMap vs the real client (see below)
 uv run e2e oracle world --variant modernity --scene gtnh-zoo --capture always --no-build
-uv run e2e --pack-version 2.9.0-RC-2 run   # every scene on 2.9.0-RC-2 (worlds/, out/e2e/, baselines/)
 ```
 
 ## What `run` does per scene
@@ -149,14 +149,14 @@ intentional rendering changes, after reviewing the new screenshots.
 
 ## State oracle (`oracle states`)
 
-Compares BlueMap's rendering of every block state the exporter knows (62,770 with the default pack on 2.9.0-RC-2: 1,191 vanilla
-states of Mojang's 1.13 flattening table plus every state of the pack's `gtnh/blocks.ndjson`, GregTech machines
-included) with the real GTNH client drawing the same state in isolation. Outputs go to
+Compares BlueMap's rendering of every block state the exporter knows (62,659 with the default pack on 2.9.0: 1,191
+vanilla states of Mojang's 1.13 flattening table plus the 61,468 states of the pack's `gtnh/blocks.ndjson`, GregTech
+machines included) with the real GTNH client drawing the same state in isolation. Outputs go to
 `<workspace>/out/oracle-2.9.0/<variant>/states/` and are never committed (they hold Mojang and mod textures).
 
 ```bash
-cd ../gtnh-exporter/launcher && uv run gtnh-client states                 # reference: client/ (about 80 s)
-cd ../../e2e && uv run e2e oracle states --variant default                # BlueMap side, compare, report (about 90 s)
+cd ../gtnh-exporter/launcher && uv run gtnh-client states                 # reference: client/ (about 70 s)
+cd ../../e2e && uv run e2e oracle states --variant default                # BlueMap side, compare, report (about 100 s)
 # modernity: gtnh-client states --variant modernity --client-dir ../../clients/gtnh-modernity-2.9.0 \
 #   --resource-pack <Modernity zip> --extra-mod <MyCTMLib jar>, then e2e oracle states --variant modernity
 ```
@@ -220,7 +220,9 @@ cd ../../e2e && uv run e2e oracle states --variant default                # Blue
    letting many nearly exact faces of a few blocks set the fence). Fewer than 8 inexact samples: exact agreement.
    `iou_min`/`ssim_min` = Q1 - 3 IQR, `delta_e_max` = Q3 + 3 IQR. They are not tuned by hand; `calibration.json`
    and `report.html` carry the distributions, the sets and the calibration states the thresholds fail
-   (`falseFailures`).
+   (`falseFailures`). The 2.9.0 default run calibrated: view IoU 1.0, delta E max 1.465, SSIM min 0.9913; face
+   IoU 0.9753, delta E max 2.894, SSIM min 0.9867. With them, 48,266 of the 61,513 judged states pass (78.5 %; 120
+   accepted (1.13), 789 client blank, 237 client error); Modernity: 47,138 of 61,582 (76.5 %).
 
    BlueMap never reads a model element's `shade: false` (`Element.shade` is parsed but unused, the hires tile has no
    flag, and the webapp's vertex shader lights every face by its normal), so crops, torches and other
@@ -262,12 +264,12 @@ uv run e2e oracle world --variant default --rejudge --scene vanilla-zoo --scene 
 uv run e2e oracle world --variant modernity --report-dir <copy of a scene directory>       # e.g. a saved earlier run
 ```
 
-Variants (`src/e2e/oracle/variants.py`), per pack version (`[-<version>]`: `-2.9.0` on 2.9.0, nothing on 2.9.0-RC-2):
-`default` (client `clients/gtnh-<version>`, server `gtnh-<version>`, BlueMap with the default export), `modernity`
-(client `clients/gtnh-modernity[-<version>]` with the Modernity release zip and its MyCTMLib jar for the run; BlueMap
-with the default export and both `modernity` packs of that version from `out/modernity/`), `addons` (client
-`clients/gtnh-addons[-<version>]` with the addon jars of the version in `downloads/addons/versions.json`, 5 on 2.9.0
-and 6 on 2.9.0-RC-2, server `gtnh-addons[-<version>]`, BlueMap with the addons export).
+Variants (`src/e2e/oracle/variants.py`, directories with the `-2.9.0` suffix): `default` (client `clients/gtnh-2.9.0`,
+server `gtnh-2.9.0`, BlueMap with the default export), `modernity` (client `clients/gtnh-modernity-2.9.0` with the
+Modernity release zip and its MyCTMLib jar for the run; BlueMap with the default export and both `modernity` packs
+of that version from `out/modernity/`), `addons` (client `clients/gtnh-addons-2.9.0` with the jars listed for 2.9.0
+in `downloads/addons/versions.json`: 5 addons plus GTNLLib, which GT: Not Leisure requires; server
+`gtnh-addons-2.9.0`, BlueMap with the addons export).
 
 Per scene:
 
