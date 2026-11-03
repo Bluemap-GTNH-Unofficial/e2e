@@ -120,8 +120,8 @@ def capture_reference(variant: variants.Variant, scene: str, cameras_file: Path,
            "--rcon-port", str(variant.rcon_port)]  # fmt: skip
     cmd += [f"--resource-pack={p}" for p in variant.resource_packs]
     cmd += [f"--extra-mod={m}" for m in variant.extra_mods]
-    if mod_jar:
-        cmd += ["--mod-jar", str(mod_jar)]
+    if mod_jar:  # the launcher runs in its own checkout, so a relative path must be resolved here
+        cmd += ["--mod-jar", str(mod_jar.resolve())]
     print(f"[oracle] reference capture: {subprocess.list2cmdline(cmd)}", flush=True)
     started = time.monotonic()
     log.parent.mkdir(parents=True, exist_ok=True)
