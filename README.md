@@ -17,10 +17,10 @@ approved by eye, not that it is correct. Correctness comes from the oracle, whic
 client: every block state in isolation (`uv run e2e oracle states`) and scene worlds per visible block face
 (`uv run e2e oracle world`), see below. The results of the last full run are summarised in
 `<workspace>/out/oracle-2.9.0/SUMMARY.md` (not committed). Baselines contain Minecraft and mod textures, so they are
-never committed: they live in `<workspace>/baselines-2.9.0/<scene>/<view>.png` (currently 8 scenes, 50 views, all
-approved by eye; override with `BMGTNH_BASELINES`) and are regenerated on demand. `e2e run` fails a view that has no
-baseline; review its screenshot in `<workspace>/out/e2e-2.9.0/<scene>/shots/` and then run
-`uv run e2e approve <scene> [view...]`.
+never committed: they live in `<workspace>/baselines-2.9.0/<scene>/<view>.png` (currently the baselines of
+all <!-- n:e2e.scenes -->11<!-- /n --> scenes with views, <!-- n:e2e.views -->79<!-- /n --> views, all approved by eye;
+override with `BMGTNH_BASELINES`) and are regenerated on demand. `e2e run` fails a view that has no baseline; review
+its screenshot in `<workspace>/out/e2e-2.9.0/<scene>/shots/` and then run `uv run e2e approve <scene> [view...]`.
 
 ## Setup
 
@@ -54,6 +54,7 @@ The BlueMap build log and the Minecraft client jar cache are version-independent
 
 ```bash
 uv run e2e run [scene...]            # all scenes by default; exit code 1 if any check fails
+uv run e2e run --jobs 1              # one scene at a time (default: CPUs / 10 side by side, each its own CLI and browser)
 uv run e2e run vanilla-zoo --no-build   # reuse the jars already built
 uv run e2e run gtnh-zoo --packs /path/to/exported-packs   # extra resource packs (file, or directory of packs)
 uv run e2e approve <scene> [view...]  # copy the latest screenshots to <workspace>/baselines-2.9.0/<scene>/<view>.png
@@ -72,10 +73,12 @@ uv run e2e oracle world --variant default --variant modernity --all --no-build  
    `implementations/cli/build/libs/cli-*-shadow.jar` (refused unless it contains the webapp) and the newest
    `*-addon.jar` of each addon project.
 2. **Config.** Wipes `out/e2e-2.9.0/<scene>/` and writes `config/` there: `accept-download: true`, data and webroot
-   inside the scene folder, file storage, webserver on the first free port of `127.0.0.1:8200..8209`, addon jars and
-   `--packs`/`extra_packs` in `config/packs/`, and one map per dimension that has a non-empty region file
-   (ids `overworld`, `the_nether`, `the_end`, `dim_<n>`; loader `gtnh:anvil_1_7`). Downloaded Minecraft client jars
-   are kept in `out/e2e/.cache/` and hard-linked into each scene's `data/`.
+   inside the scene folder, file storage, webserver on the first free port of `127.0.0.1:8200..8209` (reserved for
+   the CLI's lifetime with an `flock` on `<workspace>/locks/bluemap-port-<port>.lock`, so scenes, oracle runs and
+   other e2e runs starting at the same time never pick the same one), addon jars and `--packs`/`extra_packs` in
+   `config/packs/`, and one map per dimension that has a non-empty region file (ids `overworld`, `the_nether`,
+   `the_end`, `dim_<n>`; loader `gtnh:anvil_1_7`). Downloaded Minecraft client jars are kept in `out/e2e/.cache/` and
+   hard-linked into each scene's `data/`.
 3. **Render and serve.** One CLI process `-v 1.7.10 -r -f -g -w` (log `bluemap.log`). Ready once the log shows the
    render finished and saved ("Your maps are now all up-to-date!", then "Stopped.") and `settings.json` answers.
 4. **Capture**, per view, in a fresh Chromium context (SwiftShader WebGL, so pixels do not depend on the host GPU):
@@ -93,6 +96,9 @@ uv run e2e oracle world --variant default --variant modernity --all --no-build  
    failures and HTTP errors other than 404 on tiles outside the rendered area) are collected.
 5. **Check and report.** Writes `shots/<view>.png`, `shots/sky/<view>.png`, `diff/<view>.png` (failing views only:
    differing pixels in red over the dimmed shot) and `report.json`; prints a table.
+
+Scenes run side by side (`--jobs`, default CPUs / 10: 3 on 32 CPUs), each worker with its own browser; one scene
+at a time kept 26% of 32 CPUs busy on average (11 scenes, 841 s). Each scene's table is printed when it finishes.
 
 A view fails when: there is no baseline; more than `tolerance.ratio` of its pixels differ from the baseline by more
 than `tolerance.pixel` in any RGB channel; less than `min_content` of its pixels differ from the sky reference;
@@ -145,15 +151,21 @@ oracle:                     # optional, world oracle cameras (see "World oracle"
     "Natura:Natura.workbench": [13, 14, 15]   # not judged (one such block blanks its whole chunk in the client)
 ```
 
+`scenes/endgame.yaml` has no browser views; its `oracle.cameras` (one per machine of the end-game plaza, framed like
+the site demo's machine screenshots) are generated from the scene's `scene.json`:
+`uv run python -m e2e.oracle.machine_cameras [--check]` rewrites the block between its `BEGIN`/`END` comments.
+
 Baselines in `<workspace>/baselines-2.9.0/<scene>/` record the renderer state when they were approved; re-approve after
 intentional rendering changes, after reviewing the new screenshots.
 
 ## State oracle (`oracle states`)
 
-Compares BlueMap's rendering of every block state the exporter knows (62,659 with the default pack on 2.9.0: 1,191
-vanilla states of Mojang's 1.13 flattening table plus the 61,468 states of the pack's `gtnh/blocks.ndjson`, GregTech
-machines included) with the real GTNH client drawing the same state in isolation. Outputs go to
-`<workspace>/out/oracle-2.9.0/<variant>/states/` and are never committed (they hold Mojang and mod textures).
+Compares BlueMap's rendering of every block state the exporter knows (on 2.9.0 with the default pack these are
+all <!-- n:states.default.states -->62,659<!-- /n -->: the <!-- n:states.vanilla -->1,191<!-- /n --> vanilla states
+of Mojang's 1.13 flattening table plus the <!-- n:exports.default.states -->61,468<!-- /n --> states of the
+pack's `gtnh/blocks.ndjson`, GregTech machines included) with the real GTNH client drawing the same state in
+isolation. Outputs go to `<workspace>/out/oracle-2.9.0/<variant>/states/` and are never committed (they hold Mojang
+and mod textures).
 
 ```bash
 uv run e2e oracle states --variant default     # reference (cached, or gtnh-client states), BlueMap side, compare, report
@@ -164,11 +176,11 @@ uv run e2e oracle states --variant default --recapture   # capture the reference
 1. **Reference** (`client/`, exporter mod mode `states`, see the exporter and launcher READMEs): each state alone in
    a single-block world, drawn by the client's own `RenderBlocks.renderBlockByRenderType` (passes 0/1) and its
    tile-entity special renderer, into an offscreen framebuffer. `client/` links to the reference cache (see
-   "Reference cache" below); on a miss `e2e oracle states` runs `gtnh-client states` (about 70 s) with the variant's
-   client directory, `--resource-pack`, `--extra-mod` and `--states-from` (the variant's export), and checks that the
-   launcher's `states.txt` is the state list the key was computed from. `--no-capture` never launches the client
-   (without a cached reference the existing `client/` is compared and reported stale); `--parallel N` and
-   `--mod-jar` go to the launcher.
+   "Reference cache" below; in the dev container a local copy of it); on a miss `e2e oracle states` runs
+   `gtnh-client states` (about 70 s) with the variant's client directory, `--resource-pack`, `--extra-mod` and
+   `--states-from` (the variant's export), and checks that the launcher's `states.txt` is the state list the key was
+   computed from. `--no-capture` never launches the client (without a cached reference the existing `client/` is
+   compared and reported stale); `--parallel N` and `--mod-jar` go to the launcher.
 2. **BlueMap** (`bluemap/`, fork module `oracle`, `./gradlew :oracle:renderStates`): the state placed at
    (0, 64, 0) of a synthetic 1.7.10 chunk read by the real legacy chunk loader and flattening, with the client's
    tile-entity NBT, rendered by every BlueMap render pass with the variant's packs (loaded like the server mod:
@@ -228,9 +240,13 @@ uv run e2e oracle states --variant default --recapture   # capture the reference
    letting many nearly exact faces of a few blocks set the fence). Fewer than 8 inexact samples: exact agreement.
    `iou_min`/`ssim_min` = Q1 - 3 IQR, `delta_e_max` = Q3 + 3 IQR. They are not tuned by hand; `calibration.json`
    and `report.html` carry the distributions, the sets and the calibration states the thresholds fail
-   (`falseFailures`). The 2.9.0 default run calibrated: view IoU 1.0, delta E max 1.465, SSIM min 0.9913; face
-   IoU 0.9753, delta E max 2.894, SSIM min 0.9867. With them, 48,266 of the 61,513 judged states pass (78.5 %; 120
-   accepted (1.13), 789 client blank, 237 client error); Modernity: 47,138 of 61,582 (76.5 %).
+   (`falseFailures`).
+
+   <!-- numbers:e2e-states-calibration -->
+   The 2.9.0 default run calibrated: view IoU 1, delta E max 1.221, SSIM min 0.9925; face IoU 0.9753, delta E max 2.926,
+   SSIM min 0.9866. With them, 48,039 of the 61,513 judged states pass (78.10%; 120 accepted (1.13), 789 client blank,
+   237 client error); Modernity: 46,905 of 61,582 (76.17%).
+   <!-- /numbers -->
 
    BlueMap never reads a model element's `shade: false` (`Element.shade` is parsed but unused, the hires tile has no
    flag, and the webapp's vertex shader lights every face by its normal), so crops, torches and other
@@ -268,7 +284,8 @@ webapp's own shaders are checked against the game itself. Everything it writes g
 
 ```bash
 uv run e2e oracle world --variant default --scene vanilla-zoo [--scene ...] [--mod-jar JAR] [--no-build]
-uv run e2e oracle world --variant default --variant modernity --all [--parallel N]   # every scene of both variants
+uv run e2e oracle world --variant default --variant modernity --all [--parallel N] [--jobs N]   # every scene of both variants
+uv run e2e oracle world --variant default --scene gt-ores --jobs 1      # judge one view after another in this process
 uv run e2e oracle world --variant default --scene gtnh-zoo --recapture    # capture the reference again
 uv run e2e oracle world --variant default --all --no-capture              # never launch a client (BlueMap side only)
 uv run e2e oracle world --variant default --rejudge --scene vanilla-zoo --scene gtnh-zoo   # judge existing reports again
@@ -277,7 +294,7 @@ uv run e2e oracle world --variant modernity --report-dir <copy of a scene direct
 
 `--variant` and `--scene` repeat; `--all` takes every scene with oracle cameras and a dump
 (`out/scenes-2.9.0/<scene>/dump.ndjson`) that fits the variant: scenes on the addons export (`addons-*`) for
-`addons`, the others (7 on 2.9.0) for `default` and `modernity`. `--all --scene a --scene b` restricts that set to
+`addons`, the others (8 on 2.9.0) for `default` and `modernity`. `--all --scene a --scene b` restricts that set to
 `a` and `b` and only prints the scenes that are not in it.
 
 Variants (`src/e2e/oracle/variants.py`, directories with the `-2.9.0` suffix): `default` (client `clients/gtnh-2.9.0`,
@@ -298,7 +315,8 @@ Per scene:
    `excluded`.
 2. **Reference.** `client/` links to the scene's capture in the reference cache (see "Reference cache" below). The
    misses of all requested scenes are captured first, with one `gtnh-client cameras --jobs <jobs.json>` per variant
-   in the sibling `gtnh-exporter/launcher` (see its README; `--parallel N` and `--mod-jar` are passed on): the client
+   in the sibling `gtnh-exporter/launcher` (see its README; `--parallel N` and `--mod-jar` are passed on, without
+   `--parallel` the launcher's default of 3 worker clients applies): the client
    opens each scene's world snapshot as a single-player save, turns random ticks off, sets the `remove` cells to air
    and writes `<view>.{png,depth.bin,json}` (colour, depth buffer, projection and modelview matrices, eye position)
    and `cameras-report.json`. A scene whose capture is incomplete is compared on the cameras that were captured but
@@ -317,7 +335,12 @@ Per scene:
    The colour frame is read from the WebGL buffer once two consecutive frames are identical; a second pass writes
    the hires surfaces' view-space depth (`bluemap/<view>.png`, `bluemap/<view>.depth.bin`). Rendering the 7 scenes in
    one process takes 21.0 s instead of 46.5 s for 7 processes with the default packs, 22.3 s instead of 52.0 s with
-   Modernity's (JVM start and resource loading once; measured 2026-11-02).
+   Modernity's (JVM start and resource loading once; measured 2026-11-02). The views are judged (capture and steps 4
+   to 6) by `--jobs N` judge processes, each with its own headless Chromium (default one per 4 CPUs: a judge's
+   Chromium and comparison keep about 4 busy). Each variant queues all its views (camera order, scene after scene,
+   the calibration scene first) as soon as its CLI serves them, and the next variant's CLI renders meanwhile. A
+   scene is judged and reported once its last view is done, the run's calibration scene before any other; a CLI
+   stops after its last scene. `--jobs 1` judges one view after another in the `e2e` process with one Chromium.
 4. **Faces** (`src/e2e/oracle/faces.py`). Both renderings are labelled per pixel from their own depth and the client's
    matrices: the block cell the visible surface lies in (a hit point within the depth error of a block plane belongs
    to the cell beyond it, others are pushed a little along the ray) and the cell face the view ray enters it through.
@@ -330,13 +353,16 @@ Per scene:
 6. **Metrics** per face with the shared region metrics (`src/e2e/oracle/metrics.py`): the client's region against
    BlueMap's region of the same face, leaving out pixels where the other rendering shows a nearer surface of
    something else (that difference is the occluder's). IoU, mean CIEDE2000 and SSIM; faces with fewer than 64 pixels
-   are not judged. **Translucent faces** show what is behind them: where either rendering shows a translucent dump
-   cell (a state whose isolated client render in the state oracle has at least half of its covered pixels below
-   alpha 250: stained glass, ice, water, ...) and the view ray, followed through the dump grid past translucent
-   cells, reaches an accepted (1.13) or excluded cell or nothing of the dump (the terrain around the scene, sky),
-   the pixel counts for the IoU but not for delta E and SSIM (`background_excluded` in the report): the colour there
-   is the background's, which is judged (or accepted) as its own face. On vanilla-zoo this is the randomly rotated
-   1.13 stone floor under every glass block.
+   are not judged. All faces of a view are measured at once (`compare_regions`: the per-pixel colour work once per
+   view, the SSIM boxes of similar size stacked, the per-face sums in the order of the per-face definition, so every
+   value equals `compare_region` of that face to the bit; the end-game views have up to 72,000 faces).
+   **Translucent faces** show what is behind them: where either rendering shows a translucent dump cell (a state
+   whose isolated client render in the state oracle has at least half of its covered pixels below alpha 250:
+   stained glass, ice, water, ...) and the view ray, followed through the dump grid past translucent cells, reaches
+   an accepted (1.13) or excluded cell or nothing of the dump (the terrain around the scene, sky), the pixel counts
+   for the IoU but not for delta E and SSIM (`background_excluded` in the report): the colour there is the
+   background's, which is judged (or accepted) as its own face. On vanilla-zoo this is the randomly rotated 1.13
+   stone floor under every glass block.
 7. **Thresholds** come from Tukey's far-out fences (k = 3) over the inexact samples of the `vanilla-zoo` faces
    (default variant, every face with at least 64 pixels in an aligned view) whose states look the same in 1.7.10 and
    1.13: IoU over the faces of the `geometry` set, delta E and SSIM over the `texture` set with one sample per block
@@ -350,7 +376,8 @@ Per scene:
    names (where the data backs the reason) are reported as `accepted (1.13)` and counted apart.
 8. **Report.** `report.json` (every face: block, mod, metrics, failed criteria, a first guess at the cause, accepted;
    `reference`; `timings`: `reference_capture` (client seconds, captured in this run only), `bluemap_render` (the
-   variant's shared render, `bluemap_batch` lists its scenes), `total` (this scene's views, comparison and report)),
+   variant's shared render, `bluemap_batch` lists its scenes), `total` (from the start of the scene's first view to
+   the end of its last; with `--jobs` above 1 its views share the judge processes with the other scenes)),
    `report.html` (views side by side: client, BlueMap, difference, label agreement; per-mod pass rates; the worst
    faces by mod with crops in `report/crops/`), and `../summary.json` over the variant's scenes. Exit code 1 if a
    view failed the alignment check or a scene had no reference. `--rejudge` (with `--scene`) or `--report-dir` judge
@@ -359,6 +386,26 @@ Per scene:
    calibration and `accepted.yaml` (views without a saved BlueMap depth keep their stored metrics and are listed
    under `stored_metric_views`); `--rejudge --recalibrate --variant default --scene vanilla-zoo` calibrates again
    from the rejudged faces (stored for the references in its `reference.json`).
+
+Run time, measured 2026-11-03 in the container (32 CPUs, 62 GB, Chromium on SwiftShader, no GPU) with every
+reference cached (`uv run e2e oracle world --variant default --variant modernity --all --no-build`, 8 scenes and 81
+views per variant): one view after another (`--jobs 1`, the only mode before `--jobs`) took 2103 s, the end-game
+scene alone (35 views, the compact fusion and other large multiblock views compare up to 72,000 faces each) 639 s for
+default and 612 s for Modernity; with the default 8 judge processes the same run took 489 s (end-game 169 s and
+167 s), the Modernity render overlapping default's judging. One variant alone (the `oracle:default` /
+`oracle:modernity` tasks): 291 s / 266 s with 8 judges (BlueMap render included), 426 s with 4 and 302 s with 16 for
+default: 8 judges saturate the 32 CPUs (per view the capture takes 44 % and the comparison 81 % longer than with one)
+and use about 15 GB at their peak. Every report of the 8-judge run is identical to the `--jobs 1` run's (faces with
+all metrics, alignment, checks, summaries), and two `--jobs 1` runs of the default variant an hour apart gave
+identical reports: the webapp captures are deterministic, also with 8 of them running at once (one exception seen
+since: one Modernity gtnh-zoo block whose BlueMap colours differed between two runs, delta E 19 vs 0).
+
+Since measuring every face of a view at once (step 6; before, one `compare_region` call per face) the comparison of
+an end-game view takes 3 s instead of 14 to 30 s with 8 judges, and the same run takes 387 s and 386 s (end-game about
+100 s per variant); `face_records` over all 162 views of a run takes 92 s of CPU instead of 781 s, and the face
+records of every view are identical to the per-face code's, every value to the bit. The translucent-state verdicts
+(step 6) are kept in `out/oracle-2.9.0/<variant>/worlds/see-through.json` per state capture: read in every judge
+process, gtnh-zoo's 16,000 state renders (113 s one after another over the bind mount) had made that run take 776 s.
 
 `uv run e2e oracle world-swap-test [--scene ...] [--before <old calibration.json>]` (`src/e2e/oracle/world_swap.py`)
 measures how well the world thresholds discriminate: per scene (vanilla-zoo, gt-multiblocks and gtnh-zoo by
@@ -377,6 +424,11 @@ The swap tests only run on request; they read the active calibrations.
 The real client's captures only depend on what the client sees, so both oracles keep them in a content-addressed
 cache (`src/e2e/oracle/reference.py`, `<workspace>/out/oracle-ref/2.9.0/`, never committed) and launch a client only
 for inputs that have no capture yet. Day to day only the BlueMap side runs.
+
+Measured 2026-11-03 in the container (llvmpipe, `--variant default --variant modernity --all`, 8 scenes each): with
+every reference missing (cold, `--parallel 3`) the client captures took 177 s for default and 249 s for Modernity;
+with all of them cached (hot) the run prints `references: 16/16 cached, keys 2.7s, capture 0.1s` and launches no
+client (log `out/logs/oracle-hot.log`). The BlueMap side then takes 387 s (run time under "World oracle" above).
 
 The key is the SHA-256 of a canonical JSON of:
 
@@ -408,8 +460,12 @@ out/oracle-ref/2.9.0/
 `<key>` is the first 16 hex digits. A capture is staged in `<key>.partial/` and renamed to `<key>/` only when the
 launcher reports every camera (state) captured with the expected capture version; entries are read-only and never
 change afterwards. `worlds/<scene>/client` and `states/client` are symlinks to the entry in use; `reference.json`
-next to them records its key. A miss prints which inputs differ from the newest entry of the same scene. Delete
-`out/oracle-ref/` (or an entry) to drop captures; `--recapture` replaces an entry.
+next to them records its key. Exception: when the cache is on a file system shared with the host and the oracle output
+is not (the dev container: `out/` is the Windows bind mount, `out/oracle-2.9.0/` a volume), `states/client` is a local
+copy of the entry (`.reference.json` in it names the key and when the entry was promoted; copied once per capture,
+1.5-2.5 minutes for 125,000 files), because every file access on the bind mount is a round trip to the host, and the
+state entry's files stay writable (nothing links to it). A miss prints which inputs differ from the newest entry of
+the same scene. Delete `out/oracle-ref/` (or an entry) to drop captures; `--recapture` replaces an entry.
 
 Client runs are serialised by the launcher's lock `<workspace>/locks/client.lock` (see the launcher README): a second
 `oracle world` that needs the client while another one holds it waits and prints the holder.

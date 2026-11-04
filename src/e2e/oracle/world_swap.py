@@ -93,7 +93,7 @@ def direction(scene: str, bluemap_variant: str, client_variant: str, thresholds:
         own_labels, _, _ = world.reference_labels(own_client)
         test, test_world = world.bluemap_labels(ref_client, distance)
         excluded = world.colour_excluded(ref_client, reference, ref_world, test, test_world, bg)
-        records = world.face_records(ref_client, reference, test, rgb, blocks, keys, None, excluded)
+        records = world.face_records(ref_client, reference, test, rgb, blocks, keys, excluded)
         by_key = {faces.encode(np.array([f["x"], f["y"], f["z"]]), np.array(faces.FACES.index(f["face"]))): f
                   for f in records}
         for key, d in _client_difference(ref_client, reference, own_client, own_labels, list(by_key)).items():

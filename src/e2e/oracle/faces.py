@@ -257,17 +257,45 @@ class FaceResult:
 OCCLUSION_TOLERANCE = 0.02  # blocks (plus 0.2 % of the distance): a surface this much nearer occludes
 
 
-def _not_occluded(index: np.ndarray, key: int, own: Labels, other: Labels) -> np.ndarray:
-    """The pixels of ``index`` (``own``'s region of ``key``) that ``other`` either labels ``key`` too or shows a surface
-    no nearer than ``own``'s there. Pixels where ``other`` shows a nearer surface of something else are occluded in
-    ``other``: that difference belongs to the occluder's own face, which has these pixels in its region."""
-    other_key = other.key.reshape(-1)[index]
-    own_distance = own.distance.reshape(-1)[index]
-    other_distance = other.distance.reshape(-1)[index]
-    tolerance = OCCLUSION_TOLERANCE + 0.002 * own_distance
+def _region(own: Labels, other: Labels, own_index: np.ndarray) -> np.ndarray:
+    """``own_index`` (each pixel's face in the compared keys, -1 = none) without the pixels where ``other`` shows a
+    nearer surface of something else: occluded in ``other``, that difference belongs to the occluder's own face,
+    which has these pixels in its region."""
+    tolerance = OCCLUSION_TOLERANCE + 0.002 * own.distance
     with np.errstate(invalid="ignore"):
-        nearer = other_distance < own_distance - tolerance  # NaN (nothing drawn) is never nearer
-    return index[(other_key == key) | ~nearer]
+        nearer = other.distance < own.distance - tolerance  # NaN (nothing drawn) is never nearer
+    return np.where((own_index >= 0) & ((other.key == own.key) | ~nearer), own_index, -1)
+
+
+def sorted_keys(keys: np.ndarray) -> np.ndarray:
+    """``keys`` as [index_of] wants them: sorted and unique (as they are, when they already are)."""
+    keys = np.asarray(keys, dtype=np.int64).reshape(-1)
+    return keys if keys.size < 2 or bool((keys[1:] > keys[:-1]).all()) else np.unique(keys)
+
+
+def index_of(labels: np.ndarray, keys: np.ndarray) -> np.ndarray:
+    """The position of each of ``labels`` in ``keys`` ([sorted_keys]), -1 for the labels not in them: ``np.isin`` in
+    a binary search, without sorting the labels (a view has a million) and the keys (a scene up to 1.4 million)."""
+    if not keys.size:
+        return np.full(labels.shape, -1, dtype=np.intp)
+    position = np.minimum(np.searchsorted(keys, labels), keys.size - 1)
+    return np.where(keys[position] == labels, position, -1)
+
+
+def _surface(reference: Labels, test: Labels, ref_id: np.ndarray, test_id: np.ndarray,
+             count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per face: the share of its region's pixels on the cell face plane and their median distance from the eye, of
+    the reference region, else (a face only BlueMap shows) of the test region."""
+    ref_flat, test_flat = ref_id.reshape(-1), test_id.reshape(-1)
+    ref_pixels = np.flatnonzero(ref_flat >= 0)
+    test_pixels = np.flatnonzero(test_flat >= 0)
+    test_pixels = test_pixels[np.bincount(ref_flat[ref_pixels], minlength=count)[test_flat[test_pixels]] == 0]
+    ids = np.concatenate([ref_flat[ref_pixels], test_flat[test_pixels]])
+    residual = np.concatenate([reference.residual.reshape(-1)[ref_pixels], test.residual.reshape(-1)[test_pixels]])
+    distance = np.concatenate([reference.distance.reshape(-1)[ref_pixels], test.distance.reshape(-1)[test_pixels]])
+    size = np.bincount(ids, minlength=count)
+    planar = np.bincount(ids[residual < PLANAR_EPSILON], minlength=count) / size
+    return planar, metrics.segment_median(distance[np.lexsort((distance, ids))], size)
 
 
 def cell_keys(cells: np.ndarray) -> np.ndarray:
@@ -292,6 +320,7 @@ def behind(labels: Labels, world: np.ndarray, eye: np.ndarray, pixels: np.ndarra
     ``see_through`` (cell keys; translucent cells in a row, such as a glass wall, are looked through), -1 when there is
     none within ``steps`` cells. ``world`` (H, W, 3) are the labelled hit points, ``eye`` the camera position."""
     out = np.full(labels.key.shape, -1, dtype=np.int64)
+    cells, see_through = sorted_keys(cells), sorted_keys(see_through)
     index = np.flatnonzero(pixels & (labels.key >= 0))
     if not index.size:
         return out
@@ -310,7 +339,7 @@ def behind(labels: Labels, world: np.ndarray, eye: np.ndarray, pixels: np.ndarra
         cell[pending, axis] += step[pending, axis]
         t_next[pending, axis] += t_delta[pending, axis]
         key = cell_keys(cell[pending])
-        hit = np.isin(key, cells) & ~np.isin(key, see_through)
+        hit = (index_of(key, cells) >= 0) & (index_of(key, see_through) < 0)
         found[pending[hit]] = key[hit]
         pending = pending[~hit]
         if not pending.size:
@@ -321,36 +350,32 @@ def behind(labels: Labels, world: np.ndarray, eye: np.ndarray, pixels: np.ndarra
 
 def compare_faces(reference_rgba: np.ndarray, test_rgba: np.ndarray, reference: Labels, test: Labels,
                   keys: np.ndarray, colour_excluded: np.ndarray | None = None) -> list[FaceResult]:
-    """Metrics of every face in ``keys`` that either rendering shows, computed on the bounding box of the union of
-    both regions. The reference region is where the client shows the face, the test region where BlueMap does; a
-    region's pixels where the *other* rendering shows a nearer surface of something else are left out (occluded
-    there: that difference is the occluder's), so a face is judged on its own surface only. A face only one rendering
-    shows has an empty region in the other (IoU 0). ``colour_excluded`` (H, W) pixels count for the coverage but not
-    for the colour metrics ([metrics.compare_region])."""
-    w = reference.key.shape[1]
-    ref_groups = group(np.where(np.isin(reference.key, keys), reference.key, -1))
-    test_groups = group(np.where(np.isin(test.key, keys), test.key, -1))
-    empty = np.empty(0, dtype=np.int64)
-    results = []
-    for key in sorted(set(ref_groups) | set(test_groups)):
-        ref_index = _not_occluded(ref_groups.get(key, empty), key, reference, test)
-        test_index = _not_occluded(test_groups.get(key, empty), key, test, reference)
-        if not ref_index.size and not test_index.size:
-            continue
-        index = np.concatenate([ref_index, test_index])
-        rows, cols = index // w, index % w
-        y0, y1, x0, x1 = int(rows.min()), int(rows.max()) + 1, int(cols.min()), int(cols.max()) + 1
-        box = (slice(y0, y1), slice(x0, x1))
-        ref_region = np.zeros((y1 - y0, x1 - x0), dtype=bool)
-        test_region = np.zeros_like(ref_region)
-        ref_region[ref_index // w - y0, ref_index % w - x0] = True
-        test_region[test_index // w - y0, test_index % w - x0] = True
-        m = metrics.compare_region(reference_rgba[box], test_rgba[box], ref_region, test_region,
-                                   colour_excluded=None if colour_excluded is None else colour_excluded[box])
-        source, labels = (ref_index, reference) if ref_index.size else (test_index, test)
-        residual = labels.residual.reshape(-1)[source]
-        x, y, z, face = decode(key)
-        results.append(FaceResult(key, x, y, z, face, m, (x0, y0, x1, y1),
-                                  float((residual < PLANAR_EPSILON).mean()),
-                                  float(np.median(labels.distance.reshape(-1)[source]))))
-    return results
+    """Metrics of every face in ``keys`` that either rendering shows, in key order. The reference region is where the
+    client shows the face, the test region where BlueMap does; a region's pixels where the *other* rendering shows a
+    nearer surface of something else are left out (occluded there: that difference is the occluder's), so a face is
+    judged on its own surface only. A face only one rendering shows has an empty region in the other (IoU 0). A
+    face's metrics are [metrics.compare_region] of its two regions, all faces computed at once
+    ([metrics.compare_regions]); its box is the bounding box of the union of both regions. ``colour_excluded``
+    (H, W) pixels count for the coverage but not for the colour metrics."""
+    keys = sorted_keys(keys)
+    ref_index = _region(reference, test, index_of(reference.key, keys))
+    test_index = _region(test, reference, index_of(test.key, keys))
+    shown = np.zeros(keys.size + 1, dtype=bool)  # the last slot takes the -1s
+    shown[ref_index] = True
+    shown[test_index] = True
+    shown = shown[:-1]
+    found = keys[shown]
+    if not found.size:
+        return []
+    count = found.size
+    rank = np.cumsum(shown) - 1
+    ref_id = np.where(ref_index >= 0, rank[ref_index], -1)
+    test_id = np.where(test_index >= 0, rank[test_index], -1)
+    region_metrics = metrics.compare_regions(reference_rgba, test_rgba, ref_id, test_id, count,
+                                             colour_excluded=colour_excluded)
+    y0, y1, x0, x1 = (b.tolist() for b in metrics.region_bounds(count, ref_id, test_id))
+    planar, distance = _surface(reference, test, ref_id, test_id, count)
+    cells = decode_cells(found).tolist()
+    return [FaceResult(key, *cell, FACES[face], m, box, p, d) for key, cell, face, m, box, p, d in zip(
+        found.tolist(), cells, (found & 7).tolist(), region_metrics, zip(x0, y0, x1, y1), planar.tolist(),
+        distance.tolist())]

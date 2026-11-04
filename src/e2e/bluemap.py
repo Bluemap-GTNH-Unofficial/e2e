@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +23,7 @@ JAVA_TOOL = "java@temurin-25.0.5+8.0.LTS"
 MC_VERSION = "1.7.10"
 LOADER = "gtnh:anvil_1_7"
 PORTS = range(8200, 8210)
+PORT_LOCK = "bluemap-port-{port}.lock"  # in WS/locks/, held while a CLI of this machine owns the port
 WEBAPP_ENTRY = "de/bluecolored/bluemap/webapp.zip"
 
 
@@ -235,18 +238,49 @@ def _store_downloads(data: Path) -> None:
     for jar in data.glob("minecraft-client-*.jar"):
         target = cache / jar.name
         if not target.exists():
-            shutil.copy2(jar, target)
+            # under a name of its own first: scenes run side by side (`e2e run --jobs`) may store the same jar at once
+            tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}")
+            shutil.copy2(jar, tmp)
+            os.replace(tmp, target)
+
+
+_reserved: dict[int, int] = {}  # port -> descriptor of its held PORT_LOCK, for this process's reservations
+_reserved_guard = threading.Lock()
 
 
 def free_port() -> int:
+    """A port of ``PORTS`` for a CLI's webserver, reserved for this process until ``release_port`` (``BlueMapCli.stop``)
+    or its exit: ``WS/locks/bluemap-port-<port>.lock`` is held with ``flock``, and ports another holder (another e2e or
+    oracle run, or another CLI of this process) holds are skipped, as are ports something else has bound. Probing
+    with a bind alone is not enough: the CLI binds the port only after loading its resources, seconds later, and two
+    runs starting in between got the same port (``Address already in use``)."""
+    locks = paths.workspace() / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
     for port in PORTS:
+        fd = os.open(locks / PORT_LOCK.format(port=port), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:
+                os.close(fd)  # releases the lock
                 continue
-            return port
+        with _reserved_guard:
+            _reserved[port] = fd
+        return port
     raise BlueMapError(f"no free port in {PORTS.start}..{PORTS.stop - 1}")
+
+
+def release_port(port: int) -> None:
+    """Gives up this process's reservation of ``port`` (``free_port``); nothing when it holds none."""
+    with _reserved_guard:
+        fd = _reserved.pop(port, None)
+    if fd is not None:
+        os.close(fd)
 
 
 class BlueMapCli:
@@ -263,6 +297,7 @@ class BlueMapCli:
     def __init__(self, jars: Jars, root: Path, port: int) -> None:
         self.jars = jars
         self.root = root
+        self.port = port  # reserved by free_port; released by stop
         self.url = f"http://127.0.0.1:{port}/"
         self.log = root / "bluemap.log"
         self.proc: subprocess.Popen[bytes] | None = None
@@ -319,14 +354,17 @@ class BlueMapCli:
                 if marker in line]
 
     def stop(self) -> None:
-        if self.proc is None or self.proc.poll() is not None:
-            return
-        self.proc.terminate()
+        """Stops the CLI (if it still runs) and releases its port reservation."""
         try:
-            self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+        finally:
+            release_port(self.port)
 
     def __enter__(self) -> BlueMapCli:
         self.start()

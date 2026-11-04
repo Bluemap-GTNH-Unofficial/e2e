@@ -7,10 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
 from e2e import paths, runner, scenes
-from e2e.browser import Chromium
 from e2e.oracle import cli as oracle_cli
 
 
@@ -30,6 +27,7 @@ def _print_scene(result: runner.SceneResult) -> None:
         for failure in v.failures:
             print(f"      - {failure}")
         print(f"      shot {v.shot}")
+    sys.stdout.flush()  # scenes finish one by one (`run --jobs`): show each as it does
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -38,16 +36,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     jars = runner.prepare_jars(build=not args.no_build)
     print(f"cli {jars.cli}\naddons {', '.join(str(a) for a in jars.addons)}")
     extra = tuple(Path(p).resolve() for p in args.packs)
-    results = []
-    with sync_playwright() as playwright:
-        chromium = Chromium(playwright)
-        try:
-            for spec in specs:
-                result = runner.run_scene(spec, jars, chromium, extra)
-                _print_scene(result)
-                results.append(result)
-        finally:
-            chromium.close()
+    results = runner.run_scenes(specs, jars, extra, args.jobs, _print_scene)
     failed = [r.scene for r in results if not r.ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} scenes passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0
@@ -80,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--no-build", action="store_true", help="use the existing CLI/addon jars instead of running Gradle")
     run.add_argument("--packs", action="append", default=[], metavar="PATH",
                      help="extra resource pack file or directory of packs to copy into the CLI packs/ folder")
+    run.add_argument("--jobs", type=int, default=runner.DEFAULT_JOBS,
+                     help="scenes at a time, each with its own CLI and browser (default %(default)s: CPUs / 10)")
     run.set_defaults(func=cmd_run)
 
     approve = sub.add_parser("approve", help="copy the latest screenshots of a scene to its baselines")

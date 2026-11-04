@@ -226,7 +226,7 @@ def test_second_run_launches_no_client(ws):
         assert client.is_symlink() and (client / "north.png").read_bytes() == scene.encode()
         entry = client.resolve()
         assert entry.parent == reference.world_entries(variant, scene) and (entry / "key.json").is_file()
-        assert not os.access(entry / "north.png", os.W_OK)  # cache entries are read-only
+        assert not (entry / "north.png").stat().st_mode & 0o222  # cache entries are read-only (os.access: root can write)
         ref = json.loads((world.scene_dir(variant, scene) / reference.REFERENCE).read_text())
         assert ref["cached"] is False and ref["complete"] is True
 
@@ -319,6 +319,51 @@ def test_state_reference_is_cached(ws, monkeypatch):
     listed.write_text("minecraft:stone 0\n")  # the launcher draws another list than the key says
     with pytest.raises(reference.ReferenceError, match="differs"):
         reference.ensure_states(variant, out, reference.Inputs.open(), recapture=True, capture=True, options=options)
+
+
+def test_file_system_is_the_longest_mount_prefix(tmp_path, monkeypatch):
+    mounts = tmp_path / "mounts"
+    mounts.write_text("overlay / overlay rw 0 0\ndrvfs /ws virtiofs rw 0 0\n/dev/sdc /ws/out/oracle-2.9.0 ext4 rw 0 0\n")
+    monkeypatch.setattr(reference, "MOUNTS", mounts)
+    assert reference.file_system(Path("/ws/out/oracle-ref/2.9.0")) == "virtiofs"
+    assert reference.file_system(Path("/ws/out/oracle-2.9.0/default/states")) == "ext4"
+    assert reference.file_system(Path("/ws/out/oracle-2.9.0x")) == "virtiofs"
+    assert reference.host_shared(Path("/ws/x")) and not reference.host_shared(Path("/tmp/x"))
+    # a volume below the bind mount is not shared itself, but its absolute paths cross the bind mount
+    assert not reference.host_shared(Path("/ws/out/oracle-2.9.0/x"))
+    assert reference.crosses_host_shared(Path("/ws/out/oracle-2.9.0/x"))
+    assert not reference.crosses_host_shared(Path("/tmp/x"))
+
+
+def test_host_shared_state_reference_is_copied_once_per_capture(ws, monkeypatch):
+    """With the cache on the host-shared bind mount, states/client is a local copy (no link into the cache, so the
+    entry's files are not made read-only), made once per captured entry and replacing an earlier link or copy."""
+    variant = variants.load("default")
+    listed = ws / "states-fake.txt"
+    listed.write_text(reference.state_list(variant))
+    monkeypatch.setenv("FAKE_STATES_TXT", str(listed))
+    cache = reference.root()
+    monkeypatch.setattr(reference, "host_shared", lambda path: path.resolve().is_relative_to(cache.resolve()))
+    out = ws / "out" / "oracle-2.9.0" / "default" / "states"
+    out.mkdir(parents=True)
+    (out / "client").symlink_to(ws, target_is_directory=True)  # an earlier link
+    options = reference.LaunchOptions()
+    key = reference.ensure_states(variant, out, reference.Inputs.open(), recapture=False, capture=True, options=options)
+    client = out / "client"
+    assert not client.is_symlink() and (client / "index.json").is_file()
+    assert json.loads((client / reference.COPY_MARKER).read_text())["key"] == key.digest
+    entry = reference.states_entries(variant) / key.short / "client"
+    assert (entry / "index.json").stat().st_mode & 0o200  # left writable
+
+    copy = reference.copy_reference
+    results = []
+    monkeypatch.setattr(reference, "copy_reference", lambda *a, **k: results.append(copy(*a, **k)) or results[-1])
+    reference.ensure_states(variant, out, reference.Inputs.open(), recapture=False, capture=True, options=options)
+    assert len(_launches(ws)) == 1 and results == [None]  # cached, and the local copy is current
+    reference.ensure_states(variant, out, reference.Inputs.open(), recapture=True, capture=True, options=options)
+    assert len(_launches(ws)) == 2 and results[-1] is not None  # the same key captured again: copied again
+    files, _ = results[-1]
+    assert files == sum(len(names) for _, _, names in os.walk(entry))
 
 
 # ---------------------------------------------------------------- world calibration

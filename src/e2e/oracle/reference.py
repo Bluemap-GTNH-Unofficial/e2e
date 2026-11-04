@@ -24,7 +24,11 @@ Layout (local, never committed; ``out/oracle-ref/<pack version>/``)::
 
 An entry appears atomically (staged in ``<key>.partial/`` and renamed when the launcher reports every camera / state
 captured); its files are read-only. The oracle's output directories link to it (``worlds/<scene>/client`` and
-``states/client`` are symlinks) and record the key in ``reference.json``.
+``states/client`` are symlinks) and record the key in ``reference.json``. Exception: when the cache is on a file system
+shared with the host (the dev container's bind mount of the checkout, ``HOST_SHARED``) and the oracle output is not,
+``states/client`` is a local copy of the state reference instead (``copy_reference``: one copy per capture; its ~125k
+images are read by every state oracle run, and over the bind mount each file costs milliseconds), and the state
+entry's files are left writable (nothing links to it; clearing the write bits of 125k files there took 13 minutes).
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,7 +62,13 @@ FLATTENING_TSV = "legacy/src/main/resources/de/bluecolored/bluemap/gtnh/legacy/f
 BLOCKS_NDJSON = "gtnh/blocks.ndjson"
 CAMERA_FILES = (".png", ".depth.bin", ".json")
 REFERENCE = "reference.json"  # in the oracle output directory next to the client link
-ECHO = (b"[cameras]", b"[states]", b"[run]", b"[lock]", b"[jobs]", b"[worker")
+ECHO = (b"[cameras]", b"[states]", b"[run]", b"[lock]", b"[jobs]", b"[worker", b"[bridge]")
+# File system types reached through the host: the dev container's bind mount of the checkout (virtiofs from Windows),
+# Docker Desktop's file sharing, network shares. Every open, stat or chmod there is a round trip to the host.
+HOST_SHARED = frozenset({"virtiofs", "9p", "drvfs", "fakeowner", "fuse.grpcfuse", "osxfs", "nfs", "nfs4", "cifs", "smb3"})
+COPY_MARKER = ".reference.json"  # in a local copy of a cache entry: the key and the promotion of the entry it copies
+COPY_THREADS = 16
+MOUNTS = Path("/proc/mounts")
 
 
 class ReferenceError(RuntimeError):
@@ -332,18 +343,25 @@ def staging(entry: Path) -> Path:
     return entry.with_name(entry.name + ".partial")
 
 
-def _read_only(directory: Path) -> None:
+def _read_only(directory: Path) -> int:
+    """Clears the write bits of every file below ``directory``; returns the number of files."""
+    count = 0
     for dirpath, _, files in os.walk(directory):
         for name in files:
             p = Path(dirpath) / name
             p.chmod(p.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+            count += 1
+    return count
 
 
-def promote(stage: Path, entry: Path, key: Key, extra: dict) -> None:
-    """Turns a complete staging directory into the cache entry ``entry`` (replacing an earlier one atomically)."""
+def promote(stage: Path, entry: Path, key: Key, extra: dict, *, read_only: bool = True) -> None:
+    """Turns a complete staging directory into the cache entry ``entry`` (replacing an earlier one atomically), its
+    files read-only unless ``read_only`` is False."""
+    started = time.monotonic()
     (stage / "key.json").write_text(json.dumps({"key": key.digest, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                                 **extra, "inputs": key.inputs}, indent=1) + "\n", encoding="utf-8")
-    _read_only(stage)
+    files = _read_only(stage) if read_only else 0
+    t_read_only = time.monotonic()
     old = None
     if entry.exists():
         old = entry.with_name(f"{entry.name}.old-{os.getpid()}")
@@ -351,6 +369,149 @@ def promote(stage: Path, entry: Path, key: Key, extra: dict) -> None:
     os.replace(stage, entry)
     if old is not None:
         shutil.rmtree(old)
+    print(f"[oracle] cache entry {entry}: " + (f"{files} files made read-only in {t_read_only - started:.1f}s, "
+                                               if read_only else "") +
+          f"promoted in {time.monotonic() - t_read_only:.1f}s", flush=True)
+
+
+def _mounts_above(path: Path) -> list[tuple[str, str]]:
+    """(mount point, file system type) of every mount ``path`` (existing or not) is on or below, from ``/proc/mounts``
+    (none where there is no such file), innermost last."""
+    try:
+        lines = MOUNTS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    target = str(path.resolve())
+    mounts = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mount = fields[1].replace("\\040", " ")
+        if target == mount or target.startswith(mount.rstrip("/") + "/"):
+            mounts.append((mount, fields[2]))
+    return sorted(mounts, key=lambda m: len(m[0]))
+
+
+def file_system(path: Path) -> str | None:
+    """The type of the file system ``path`` (existing or not) is on (None where ``/proc/mounts`` is missing)."""
+    mounts = _mounts_above(path)
+    return mounts[-1][1] if mounts else None
+
+
+def host_shared(path: Path) -> bool:
+    return file_system(path) in HOST_SHARED
+
+
+def crosses_host_shared(path: Path) -> bool:
+    """Whether looking ``path`` up passes a file system shared with the host: it is on one, or on a volume mounted
+    below one (``out/oracle-2.9.0`` below the dev container's ``/ws``), whose components above it each cost a round
+    trip to the host on every lookup of an absolute path."""
+    return any(kind in HOST_SHARED for _, kind in _mounts_above(path))
+
+
+def _copy_files(source: int, target: int, names: list[str]) -> None:
+    """Copies the files ``names`` from the directory ``source`` to the directory ``target`` (both file descriptors)."""
+    for name in names:
+        src = os.open(name, os.O_RDONLY, dir_fd=source)
+        try:
+            dst = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644, dir_fd=target)
+            try:
+                while chunk := os.read(src, 1 << 20):
+                    os.write(dst, chunk)
+            finally:
+                os.close(dst)
+        finally:
+            os.close(src)
+
+
+def _copy_directory(source_root: int, target_root: int, relative: str, names: list[str]) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    source = os.open(relative, flags, dir_fd=source_root)
+    try:
+        target = os.open(relative, flags, dir_fd=target_root)
+        try:
+            _copy_files(source, target, names)
+        finally:
+            os.close(target)
+    finally:
+        os.close(source)
+
+
+def copy_reference(target: Path, source: Path, stamp: dict, threads: int = COPY_THREADS) -> tuple[int, float] | None:
+    """Makes ``target`` a local copy of the directory ``source`` unless it already is a copy made with ``stamp``
+    (recorded in ``COPY_MARKER``; ``use_states_reference``: the entry's key and when it was promoted, so an entry
+    captured again under the same key is copied again); replaces an earlier link or copy. Returns (files, seconds) of a
+    copy made, None when the copy was current.
+
+    Every path component the kernel looks up on a host-shared file system is a round trip to the host (about 0.25 ms
+    in the dev container, no caching), so files are opened relative to directory descriptors (one lookup per file
+    instead of one per component of its absolute path) by ``threads`` threads, one directory at a time each."""
+    marker = target / COPY_MARKER
+    if not target.is_symlink() and marker.is_file():
+        try:
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+            if {name: recorded.get(name) for name in stamp} == stamp:
+                return None
+        except ValueError:
+            pass
+    started = time.monotonic()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.copy")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir()
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    target_root = os.open(tmp, flags)
+    try:
+        directories: list[tuple[str, list[str]]] = []
+        for dirpath, _, names, _ in os.fwalk(source):
+            relative = os.path.relpath(dirpath, source)
+            if relative != ".":
+                os.mkdir(relative, dir_fd=target_root)
+            directories.append((relative, names))
+        source_root = os.open(source, flags)
+        try:
+            with ThreadPoolExecutor(threads) as pool:
+                for future in [pool.submit(_copy_directory, source_root, target_root, relative, names)
+                               for relative, names in directories]:
+                    future.result()
+        finally:
+            os.close(source_root)
+    finally:
+        os.close(target_root)
+    files = sum(len(names) for _, names in directories)
+    (tmp / COPY_MARKER).write_text(json.dumps({**stamp, "source": str(source), "files": files}) + "\n",
+                                   encoding="utf-8")
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    os.replace(tmp, target)
+    return files, time.monotonic() - started
+
+
+def copies_states(out: Path, entry: Path) -> bool:
+    """Whether the state oracle output ``out`` gets a local copy of the cache entry ``entry`` instead of a link: the
+    cache is on a file system shared with the host and ``out`` is not (see the module doc)."""
+    return host_shared(entry) and not host_shared(out)
+
+
+def use_states_reference(out: Path, entry: Path, key: str) -> None:
+    """Makes ``out/client`` the state reference of ``entry``: a link, or a local copy (``copies_states``)."""
+    if not copies_states(out, entry):
+        link(out / "client", entry / "client")
+        return
+    try:  # promote writes key.json once per capture
+        promoted = (entry / "key.json").stat().st_mtime_ns
+    except OSError:
+        promoted = None
+    copied = copy_reference(out / "client", entry / "client", {"key": key, "promoted": promoted})
+    if copied is None:
+        print(f"[states] local copy of the reference {key[:KEY_CHARS]} is current ({out / 'client'})", flush=True)
+    else:
+        print(f"[states] reference copied from the host-shared cache: {copied[0]} files in {copied[1]:.0f}s "
+              f"({out / 'client'})", flush=True)
 
 
 def link(target: Path, entry: Path) -> None:
@@ -550,12 +711,14 @@ def ensure_states(variant: variants.Variant, out: Path, inputs: Inputs, *, recap
                   options: LaunchOptions) -> Key:
     """Makes ``out/client`` (the state oracle's reference directory) the cached capture of the variant's states,
     running ``gtnh-client states`` on a miss. Returns the key."""
+    started = time.monotonic()
     key = inputs.states(variant)
     inputs.save()
+    print(f"[states] reference key {key.short} computed in {time.monotonic() - started:.1f}s", flush=True)
     entry = states_entries(variant) / key.short
     if not recapture and (entry / "client" / "index.json").is_file():
         print(f"[states] reference {key.short} cached ({entry})", flush=True)
-        link(out / "client", entry / "client")
+        use_states_reference(out, entry, key.digest)
         record(out, {"key": key.digest, "entry": str(entry), "cached": True, "stale": False})
         return key
     note = "recapture requested" if recapture else explain(key, states_entries(variant))
@@ -583,8 +746,10 @@ def ensure_states(variant: variants.Variant, out: Path, inputs: Inputs, *, recap
     if not listed.is_file() or listed.read_text(encoding="utf-8") != state_list(variant):
         raise ReferenceError(f"{listed} differs from the state list e2e computed for the key (reference.state_list "
                              f"and the launcher's states.write_states disagree); log {log}")
-    promote(stage, entry, key, {"variant": variant.name, "log": str(log), "seconds": round(seconds, 1)})
-    link(out / "client", entry / "client")
+    # read through a local copy (use_states_reference): nothing links to the entry, no read-only marking needed
+    promote(stage, entry, key, {"variant": variant.name, "log": str(log), "seconds": round(seconds, 1)},
+            read_only=not copies_states(out, entry))
+    use_states_reference(out, entry, key.digest)
     record(out, {"key": key.digest, "entry": str(entry), "cached": False, "stale": False, "log": str(log),
                  "seconds": round(seconds, 1)})
     return key

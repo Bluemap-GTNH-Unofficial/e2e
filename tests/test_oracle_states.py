@@ -1,6 +1,10 @@
 import io
 import json
+import os
+import shlex
+import subprocess
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -164,3 +168,43 @@ def test_run_judges_reports_and_calibrates(workspace):
     assert states.run(variants.load("default"), render=False, only=None, workers=1, recalibrate=False) == 1
     assert json.loads((out / "report.json").read_text())["calibrationWritten"] is True
     assert states.calibration_target()[1] != artifact
+
+
+def test_host_shared_packs_are_read_from_local_copies(workspace, monkeypatch):
+    variant = variants.load("default")
+    out = states.states_dir(variant)
+    assert states.bluemap_packs(variant, out) == list(variant.bluemap_packs)  # nothing shared: the packs themselves
+    shared = paths.pack().export.parent
+    paths.pack().export.write_bytes(b"pack")
+    monkeypatch.setattr(reference, "host_shared", lambda p: p.resolve().is_relative_to(shared.resolve()))
+    packs = states.bluemap_packs(variant, out)
+    assert [p.name for p in packs] == [p.name for p in variant.bluemap_packs]
+    assert out / "packs" / paths.pack().export.name in packs
+    for pack, source in zip(packs, variant.bluemap_packs):
+        if source.resolve().is_relative_to(shared.resolve()):
+            assert pack == out / "packs" / source.name and pack.read_bytes() == source.read_bytes()
+        else:
+            assert pack == source
+
+
+def test_bluemap_side_writes_through_a_descriptor_when_its_path_crosses_the_host(workspace, monkeypatch):
+    variant = variants.load("default")
+    out = states.states_dir(variant)
+    out.mkdir(parents=True, exist_ok=True)
+    seen = []
+
+    def run(cmd, **_):
+        args = shlex.split(cmd[-1].removeprefix("--args="))
+        target = Path(args[args.index("--out") + 1])
+        seen.append((target, target.parent.resolve() == out.resolve()))  # resolved while the descriptor is open
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(states.subprocess, "run", run)
+    monkeypatch.setattr(reference, "crosses_host_shared", lambda p: False)
+    states.render_bluemap(variant, out, out / "bluemap.log")
+    assert seen.pop() == (out / "bluemap", True)
+    if Path(f"/proc/{os.getpid()}/fd").is_dir():  # Linux
+        monkeypatch.setattr(reference, "crosses_host_shared", lambda p: True)
+        states.render_bluemap(variant, out, out / "bluemap.log")
+        target, resolved = seen.pop()
+        assert str(target).startswith(f"/proc/{os.getpid()}/fd/") and target.name == "bluemap" and resolved

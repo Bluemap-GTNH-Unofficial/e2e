@@ -34,8 +34,9 @@ def diff_image(reference: np.ndarray, test: np.ndarray, mask: np.ndarray | None 
 def label_image(reference: faces.Labels, test: faces.Labels, keys: np.ndarray) -> np.ndarray:
     """Dump-face label agreement: grey = same face in both, red = the client's face differs from BlueMap's, blue =
     a dump face only BlueMap shows there; dark grey = surfaces outside the dump."""
-    ref_in = np.isin(reference.key, keys)
-    test_in = np.isin(test.key, keys)
+    keys = faces.sorted_keys(keys)
+    ref_in = faces.index_of(reference.key, keys) >= 0
+    test_in = faces.index_of(test.key, keys) >= 0
     out = np.zeros(reference.key.shape + (3,), dtype=np.uint8)
     out[(reference.key >= 0) | (test.key >= 0)] = (60, 60, 60)
     same = ref_in & (reference.key == test.key)

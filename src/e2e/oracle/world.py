@@ -9,7 +9,9 @@ Per scene and variant (outputs in ``out/oracle/<variant>/worlds/<scene>/``, neve
 3. BlueMap: every scene of a variant rendered by one BlueMap CLI process with the variant's packs (one map per scene,
    ``worlds/_bluemap/``), served, and captured at the client's exact matrices with the capture conditions of the
    client (``oracle.webapp``): ``bluemap/<view>.png`` and ``bluemap/<view>.depth.bin`` (float32 view-space depth,
-   NaN = nothing drawn).
+   NaN = nothing drawn). ``--jobs N`` judge processes, each with its own headless Chromium, capture and compare the
+   views of every scene of the run at once (the next variant renders meanwhile); ``--jobs 1`` judges one view after
+   another in this process.
 4. Faces: both renderings are labelled per pixel with the dump block and cell face they show (``oracle.faces``);
    alignment is checked first (block-edge reprojection error, global shift), then every face of a dump block that
    either rendering shows is compared with the shared region metrics (``oracle.metrics``).
@@ -27,16 +29,22 @@ nor failing. ``--rejudge`` / ``--report-dir`` judge an existing ``report.json`` 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import multiprocessing
+import multiprocessing.util
+import os
 import shutil
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from e2e import bluemap, paths, runner, scenes
@@ -49,6 +57,9 @@ CALIBRATION_SCENE = "vanilla-zoo"
 CALIBRATION_VARIANT = "default"
 MIN_PIXELS = 64  # faces whose coverage union is smaller are reported but not judged
 CROPS = 60  # worst faces per scene that get a crop image
+# judge processes (--jobs): one per 4 CPUs, a judge's Chromium (SwiftShader) and comparison keep about 4 busy. On the
+# 32-CPU container the default variant (81 views) took 291 s with 8, 302 s with 16, 426 s with 4 (README, run time)
+JOBS = max(1, (os.cpu_count() or 4) // 4)
 
 
 def calibration_file() -> Path:
@@ -93,8 +104,9 @@ def load_dump(scene: str) -> dict[tuple[int, int, int], Block]:
 
 
 def dump_keys(blocks: dict[tuple[int, int, int], Block]) -> np.ndarray:
+    """The face keys of the dump's cells (six per cell), sorted: [faces.index_of] looks labels up in them."""
     cells = np.asarray(list(blocks), dtype=np.int64)
-    return np.concatenate([faces.encode(cells, np.full(len(cells), f)) for f in range(len(faces.FACES))])
+    return np.sort(np.concatenate([faces.encode(cells, np.full(len(cells), f)) for f in range(len(faces.FACES))]))
 
 
 # ---------------------------------------------------------------- scenes of a run
@@ -200,29 +212,18 @@ def suspect(face: dict) -> str:
     return "; ".join(reasons) or "borderline"
 
 
-def _face_record(view: str, result: faces.FaceResult, block: dict, thresholds: metrics.Thresholds | None,
-                 magenta: float) -> dict:
+def _face_record(view: str, result: faces.FaceResult, block: dict, magenta: float) -> dict:
+    """A face's measurements; ``judge`` gives the verdict (``judged`` ... ``suspect``) with the run's thresholds."""
     m = result.metrics
-    record = {"view": view, "x": result.x, "y": result.y, "z": result.z, "face": result.face, **block,
-              **m.to_json(), "planar": round(result.planar, 3), "distance": round(result.distance, 2),
-              "bbox": list(result.bbox), "magenta": round(magenta, 3)}
-    judged = m.union_pixels >= (thresholds.min_pixels if thresholds else MIN_PIXELS)
-    failed = thresholds.check(m) if thresholds and judged else []
-    record["judged"] = judged
-    record["passed"] = judged and thresholds is not None and not failed
-    record["failed"] = failed
-    record["failed_iou"] = any(f.startswith("iou") for f in failed)
-    record["failed_delta_e"] = any(f.startswith("delta_e") for f in failed)
-    record["failed_ssim"] = any(f.startswith("ssim") for f in failed)
-    record["severity"] = severity(m, thresholds) if failed else 0.0
-    record["suspect"] = suspect(record) if failed else ""
-    return record
+    return {"view": view, "x": result.x, "y": result.y, "z": result.z, "face": result.face, **block,
+            **m.to_json(), "planar": round(result.planar, 3), "distance": round(result.distance, 2),
+            "bbox": list(result.bbox), "magenta": round(magenta, 3), "judged": m.union_pixels >= MIN_PIXELS,
+            "passed": False, "failed": [], "failed_iou": False, "failed_delta_e": False, "failed_ssim": False,
+            "severity": 0.0, "suspect": ""}
 
 
-def severity(m: metrics.RegionMetrics, t: metrics.Thresholds | None) -> float:
+def severity(m: metrics.RegionMetrics, t: metrics.Thresholds) -> float:
     """Sum of the relative exceedances of the failed criteria (worst faces first)."""
-    if t is None:
-        return 0.0
     total = max(0.0, t.iou_min - m.iou) / max(t.iou_min, 1e-6)
     if not math.isnan(m.delta_e):
         total += max(0.0, m.delta_e - t.delta_e_max) / max(t.delta_e_max, 1e-6)
@@ -250,38 +251,65 @@ def bluemap_labels(client: cameras.ClientView, distance: np.ndarray) -> tuple[fa
 
 SEE_THROUGH_ALPHA = 250  # client state render: a covered pixel below this alpha (over black and white) is translucent
 SEE_THROUGH_SHARE = 0.5  # a state is translucent when at least this share of its covered pixels is
+SEE_THROUGH_READERS = 16  # threads reading state renders (gtnh-zoo's 16,000: 113 s one after another, 44 s with 16)
+
+
+def _translucent_render(path: Path | None) -> bool:
+    if path is None or not path.is_file():
+        return False
+    with Image.open(path) as image:
+        alpha = np.asarray(image.convert("RGBA"))[..., 3]
+    covered = alpha > 0
+    return bool(covered.any() and (alpha[covered] < SEE_THROUGH_ALPHA).mean() >= SEE_THROUGH_SHARE)
 
 
 def see_through_labels(variant: variants.Variant, labels: set[str]) -> set[str]:
     """The ``labels`` whose isolated client render of the state oracle (the variant's, else the default variant's)
     is translucent: at least ``SEE_THROUGH_SHARE`` of its covered pixels have an alpha below ``SEE_THROUGH_ALPHA``
-    (stained glass, ice, water; cut-out blocks such as leaves and glass are opaque where they draw)."""
+    (stained glass, ice, water; cut-out blocks such as leaves and glass are opaque where they draw). The verdicts
+    are kept per state capture (its reference key and ``index.json``) in ``see-through.json`` next to the world
+    reports of the variant whose renders are read, and a run reads only the renders of labels without one: reading
+    gtnh-zoo's 16,000 renders over the bind mount takes 44 s with ``SEE_THROUGH_READERS`` threads, and the BlueMap
+    render it overlapped took 168 s instead of 63 s."""
     from e2e.oracle import states
 
-    client_dir = states.states_dir(variant) / "client"
+    if not labels:
+        return set()
+    source: variants.Variant | str = variant
+    client_dir = states.states_dir(source) / "client"
     if not (client_dir / "index.json").is_file():
-        client_dir = states.states_dir(states.CALIBRATION_VARIANT) / "client"
+        source = states.CALIBRATION_VARIANT
+        client_dir = states.states_dir(source) / "client"
     if not (client_dir / "index.json").is_file():
         return set()
-    paths_by_label: dict[str, str] = {}
-    for s in json.loads((client_dir / "index.json").read_text(encoding="utf-8"))["states"]:
-        if s.get("error") or s.get("blank"):
-            continue
-        if s.get("mte") is not None:
-            paths_by_label.setdefault(f"{s['name']}:{s.get('worldMeta', s['meta'])}#{s['mte']}", s["path"])
-        else:
-            paths_by_label.setdefault(f"{s['name']}:{s['meta']}", s["path"])
-    out = set()
-    for label in labels:
-        path = client_dir / f"{paths_by_label.get(label, '')}.png"
-        if label not in paths_by_label or not path.is_file():
-            continue
-        with Image.open(path) as image:
-            alpha = np.asarray(image.convert("RGBA"))[..., 3]
-        covered = alpha > 0
-        if covered.any() and (alpha[covered] < SEE_THROUGH_ALPHA).mean() >= SEE_THROUGH_SHARE:
-            out.add(label)
-    return out
+    index = (client_dir / "index.json").read_bytes()
+    capture = f"{reference.recorded_key(states.states_dir(source))}:{hashlib.sha256(index).hexdigest()}"
+    cache = variants.oracle_dir(source) / "worlds" / "see-through.json"
+    known: dict[str, bool] = {}
+    if cache.is_file():
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        if stored.get("capture") == capture:
+            known = stored["translucent"]
+    missing = [label for label in labels if label not in known]
+    if missing:
+        paths_by_label: dict[str, str] = {}
+        for s in json.loads(index)["states"]:
+            if s.get("error") or s.get("blank"):
+                continue
+            if s.get("mte") is not None:
+                paths_by_label.setdefault(f"{s['name']}:{s.get('worldMeta', s['meta'])}#{s['mte']}", s["path"])
+            else:
+                paths_by_label.setdefault(f"{s['name']}:{s['meta']}", s["path"])
+        renders = [client_dir / f"{paths_by_label[label]}.png" if label in paths_by_label else None
+                   for label in missing]
+        with ThreadPoolExecutor(SEE_THROUGH_READERS, thread_name_prefix="see-through") as readers:
+            known.update(zip(missing, readers.map(_translucent_render, renders)))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        partial = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        partial.write_text(json.dumps({"capture": capture, "translucent": known}, sort_keys=True) + "\n",
+                           encoding="utf-8")
+        os.replace(partial, cache)
+    return {label for label in labels if known[label]}
 
 
 @dataclass
@@ -290,16 +318,19 @@ class Backgrounds:
     them), its translucent cells and the cells whose appearance is known to differ (accepted 1.13 states where the
     data backs the reason, excluded cells)."""
 
-    cells: np.ndarray  # cell keys (faces.cell_keys)
+    cells: np.ndarray  # cell keys (faces.cell_keys), sorted as each of the three
     see_through: np.ndarray
     differing: np.ndarray
 
 
-def backgrounds(variant: variants.Variant, blocks: dict, removed: list, accepted_list: accepted.Accepted) -> Backgrounds:
+def backgrounds(variant: variants.Variant, blocks: dict, removed: list, accepted_list: accepted.Accepted,
+                translucent: set[str] | None = None) -> Backgrounds:
+    """``translucent``: the blocks' [see_through_labels] when they are known already."""
     def keys_of(cells: list) -> np.ndarray:
         return np.unique(faces.cell_keys(np.asarray(cells, dtype=np.int64).reshape(-1, 3)))
 
-    translucent = see_through_labels(variant, {b.label for b in blocks.values()})
+    if translucent is None:
+        translucent = see_through_labels(variant, {b.label for b in blocks.values()})
     differing = list(removed)
     for p, b in blocks.items():
         entry, backed = accepted_list.check(b.name, b.meta)
@@ -320,47 +351,74 @@ def colour_excluded(client: cameras.ClientView, reference: faces.Labels, ref_wor
         return out
     for labels, world in ((reference, ref_world), (test, test_world)):
         own = np.where(labels.key >= 0, labels.key & ~np.int64(7), -1)
-        translucent = np.isin(own, bg.see_through)
+        translucent = faces.index_of(own, bg.see_through) >= 0
         beyond = faces.behind(labels, world, client.eye, translucent, bg.cells, bg.see_through)
-        out |= translucent & ((beyond < 0) | np.isin(beyond, bg.differing))
+        out |= translucent & ((beyond < 0) | (faces.index_of(beyond, bg.differing) >= 0))
     return out
 
 
+def _in_box(ids: np.ndarray, x0: np.ndarray, y0: np.ndarray, x1: np.ndarray, y1: np.ndarray,
+            pixels: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """The ``pixels`` (flat indices, default all) whose face ``ids`` (H, W, -1 = none) is one with its box (x0, y0,
+    x1, y1 per face) around the pixel, and their faces."""
+    w = ids.shape[1]
+    flat = ids.reshape(-1)
+    pixels = np.flatnonzero(flat >= 0) if pixels is None else pixels[flat[pixels] >= 0]
+    face = flat[pixels]
+    rows, cols = np.divmod(pixels, w)
+    inside = (rows >= y0[face]) & (rows < y1[face]) & (cols >= x0[face]) & (cols < x1[face])
+    return pixels[inside], face[inside]
+
+
 def face_records(client: cameras.ClientView, reference: faces.Labels, test: faces.Labels, test_rgb: np.ndarray,
-                 blocks: dict, keys: np.ndarray, thresholds: metrics.Thresholds | None,
-                 excluded: np.ndarray | None = None) -> list[dict]:
-    """One record per dump face either rendering shows (``faces.compare_faces``); ``excluded`` pixels are left out
-    of the colour metrics ([colour_excluded])."""
+                 blocks: dict, keys: np.ndarray, excluded: np.ndarray | None = None) -> list[dict]:
+    """One record per dump face either rendering shows (``faces.compare_faces``), to be judged by ``judge``;
+    ``excluded`` pixels are left out of the colour metrics ([colour_excluded]). A face's ``magenta`` share is that of
+    the test pixels of the face in its box (occluded ones too), ``background_excluded`` counts the ``excluded``
+    pixels of the face in either rendering in its box."""
     results = faces.compare_faces(_rgba(client.image), _rgba(test_rgb), reference, test, keys, excluded)
-    magenta = image_metrics.magenta_mask(test_rgb[..., :3])
+    if not results:
+        return []
+    count = len(results)
+    found = np.array([r.key for r in results], dtype=np.int64)
+    x0, y0, x1, y1 = np.array([r.bbox for r in results], dtype=np.int64).T
+    test_id = faces.index_of(test.key, found)
+    pixels, face = _in_box(test_id, x0, y0, x1, y1)
+    shown = np.bincount(face, minlength=count)
+    magenta = np.bincount(face[image_metrics.magenta_mask(test_rgb[..., :3]).reshape(-1)[pixels]], minlength=count)
+    share = np.divide(magenta, shown, out=np.zeros(count), where=shown > 0).tolist()
+    background = [None] * count
+    if excluded is not None:
+        candidates = np.flatnonzero(excluded)
+        ref_id = faces.index_of(reference.key, found)
+        _, ref_face = _in_box(ref_id, x0, y0, x1, y1, candidates)
+        test_pixels, test_face = _in_box(test_id, x0, y0, x1, y1, candidates)
+        also = test_face != ref_id.reshape(-1)[test_pixels]  # a pixel of the face in both renderings counts once
+        background = (np.bincount(ref_face, minlength=count) + np.bincount(test_face[also], minlength=count)).tolist()
     records = []
-    for result in results:
+    for result, magenta_share, background_excluded in zip(results, share, background):
         block = blocks[(result.x, result.y, result.z)]
-        x0, y0, x1, y1 = result.bbox
-        test_region = test.key[y0:y1, x0:x1] == result.key
-        share = float(magenta[y0:y1, x0:x1][test_region].mean()) if test_region.any() else 0.0
         record = _face_record(client.name, result, {"block": block.name, "meta": block.meta, "label": block.label,
-                                                    "mod": block.mod}, thresholds, share)
+                                                    "mod": block.mod}, magenta_share)
         if excluded is not None:
-            region = (reference.key[y0:y1, x0:x1] == result.key) | test_region
-            record["background_excluded"] = int((excluded[y0:y1, x0:x1] & region).sum())
+            record["background_excluded"] = background_excluded
         records.append(record)
     return records
 
 
 def compare_view(client: cameras.ClientView, capture: webapp.WebappCapture, blocks: dict, keys: np.ndarray,
-                 thresholds: metrics.Thresholds | None, out: Path, bg: Backgrounds) -> tuple[list[dict], dict, dict]:
-    """Face records, the alignment and the matrix/consistency checks of one view."""
+                 out: Path, bg: Backgrounds) -> tuple[list[dict], dict, dict]:
+    """Face records (unjudged), the alignment and the matrix/consistency checks of one view (``keys``: [dump_keys])."""
     reference, ref_eye, ref_world = reference_labels(client)
     test, test_world = bluemap_labels(client, capture.distance)
 
-    in_dump = np.isin(reference.key, keys)
+    in_dump = faces.index_of(reference.key, keys) >= 0
     focal = client.height / 2.0 * client.projection[1, 1]
     with np.errstate(divide="ignore", invalid="ignore"):
         pixels_per_block = focal / np.maximum(-ref_eye[..., 2], 1e-6)
     alignment = faces.alignment(reference, test, in_dump, pixels_per_block)
     excluded = colour_excluded(client, reference, ref_world, test, test_world, bg)
-    records = face_records(client, reference, test, capture.rgba, blocks, keys, thresholds, excluded)
+    records = face_records(client, reference, test, capture.rgba, blocks, keys, excluded)
     expected_p, expected_mv = cameras.expected_matrices(
         {"fov": client.meta["fov"], "yaw": client.meta["yaw"], "pitch": client.meta["pitch"]},
         client.width, client.height, float(client.meta["far"]))
@@ -377,16 +435,17 @@ def compare_view(client: cameras.ClientView, capture: webapp.WebappCapture, bloc
         "webapp_frames": capture.frames,
         "webapp_console_errors": capture.console_errors[:5],
         "reference_dump_pixels": int(in_dump.sum()),
-        "test_dump_pixels": int(np.isin(test.key, keys).sum()),
+        "test_dump_pixels": int((faces.index_of(test.key, keys) >= 0).sum()),
     }
     world_report.save_view_images(out, client, capture, reference, test, keys)
     return records, alignment.to_json(), checks
 
 
 def area(client: cameras.ClientView, keys: np.ndarray) -> tuple[tuple[float, float, float], float]:
-    """Centre and radius (blocks) of the dump cells the client shows, for the webapp's hires tile loading."""
+    """Centre and radius (blocks) of the dump cells (``keys``: [dump_keys]) the client shows, for the webapp's hires
+    tile loading."""
     labels, _, world = reference_labels(client)
-    shown = np.isin(labels.key, keys)
+    shown = faces.index_of(labels.key, keys) >= 0
     if not shown.any():
         x, y, z = client.camera
         return (float(x), float(y), float(z)), 64.0
@@ -439,14 +498,6 @@ def plan_calibration(runs: list[SceneRun], inputs: reference.Inputs, recalibrate
     print(f"[oracle] world calibration: {CALIBRATION_VARIANT}/{CALIBRATION_SCENE} calibrates "
           f"({'--recalibrate' if recalibrate else 'no stored calibration for its references'})", flush=True)
     return CalibrationPlan(True, artifact, references)
-
-
-def active_thresholds() -> metrics.Thresholds:
-    path = calibration_file()
-    if not path.is_file():
-        raise FileNotFoundError(f"{path} does not exist; run `uv run e2e oracle world --variant {CALIBRATION_VARIANT} "
-                                f"--scene {CALIBRATION_SCENE}` first (it calibrates the thresholds)")
-    return metrics.Thresholds.from_json(json.loads(path.read_text(encoding="utf-8"))["thresholds"])
 
 
 def region_metrics(face: dict) -> metrics.RegionMetrics:
@@ -628,55 +679,168 @@ def start_bluemap(group: RenderGroup, jars: bluemap.Jars) -> bluemap.BlueMapCli:
     return cli
 
 
-def run_scene(run: SceneRun, client_dir: Path | None, cli: bluemap.BlueMapCli, group: RenderGroup, browser,
-              plan: CalibrationPlan) -> dict:
-    """BlueMap's captures of a scene from the group's running CLI, compared with the client's, judged, reported."""
-    started = time.monotonic()
+@dataclass
+class SceneData:
+    """What comparing a scene's views needs besides the two captures."""
+
+    blocks: dict
+    keys: np.ndarray
+    bg: Backgrounds
+
+
+def scene_data(variant: variants.Variant, packs: list, blocks: dict, removed: list,
+               translucent: set[str] | None = None) -> SceneData:
+    return SceneData(blocks, dump_keys(blocks), backgrounds(variant, blocks, removed, load_accepted(packs), translucent))
+
+
+@dataclass(frozen=True)
+class ViewJob:
+    """One camera of a scene, captured from its group's running CLI and compared (pickled to a judge process)."""
+
+    variant: variants.Variant
+    scene: str
+    packs: tuple[Path, ...]
+    out: Path
+    client_dir: Path
+    url: str
+    index: int  # in the scene's camera list
+    camera: str
+    source: str
+    translucent: frozenset[str]  # the scene's see_through_labels, read once by the run (not by every judge process)
+
+
+def judge_view(job: ViewJob, data: SceneData, browser) -> tuple[ViewOutcome, float]:
+    """The webapp capture of one camera compared with the client's (``error`` when the capture failed) and when its
+    judging started (``time.monotonic``)."""
+    view = ViewOutcome(job.camera, job.source)
+    t0 = time.monotonic()
+    client = cameras.ClientView.load(job.client_dir, job.camera)
+    centre, radius = area(client, data.keys)
+    try:
+        capture = webapp.capture(browser, job.url, bluemap.map_id(job.scene), cameras.webapp_camera(client), centre,
+                                 radius, client.width, client.height)
+    except PlaywrightError as e:  # e.g. the map not loaded within the load timeout: this view only
+        view.error = f"webapp capture failed: {str(e).splitlines()[0]}"
+        return view, t0
+    t1 = time.monotonic()
+    view.faces, view.alignment, view.checks = compare_view(client, capture, data.blocks, data.keys, job.out, data.bg)
+    view.seconds = {"webapp": round(t1 - t0, 1), "compare": round(time.monotonic() - t1, 1),
+                    "client": round(float(client.meta.get("seconds", 0.0)), 1)}
+    return view, t0
+
+
+def view_line(job: ViewJob, view: ViewOutcome) -> str:
+    where = f"[oracle] {job.variant.name}/{job.scene}/{view.name}"
+    if view.error:
+        return f"{where}: {view.error}"
+    a = view.alignment
+    return (f"{where}: {len(view.faces)} faces, alignment {'ok' if a['passed'] else 'FAILED'} (shift {a['shift']}, "
+            f"edge median {a['edge_error_median_px']} px, p90 {a['edge_error_p90_px']} px), "
+            f"webapp {view.seconds['webapp']}s, compare {view.seconds['compare']}s")
+
+
+_judge_process: dict = {}  # in a judge process: its Chromium and the data of its latest scenes
+
+
+def _judge_process_start() -> None:
+    """Initializer of a judge process: its own Playwright and Chromium (the sync API is per process), closed when the
+    process exits."""
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+
+    def close() -> None:
+        browser.close()
+        playwright.stop()
+
+    multiprocessing.util.Finalize(None, close, exitpriority=10)
+    _judge_process.update(browser=browser, scenes={})
+
+
+def _judge_process_view(job: ViewJob) -> tuple[ViewOutcome, float]:
+    known: dict = _judge_process["scenes"]
+    key = (job.variant.name, job.scene)
+    data = known.pop(key, None)
+    if data is None:
+        blocks, removed, _ = scene_blocks(job.scene)
+        data = scene_data(job.variant, list(job.packs), blocks, removed, set(job.translucent))
+    known[key] = data  # the latest last; jobs come scene after scene, two cover a scene boundary
+    if len(known) > 2:
+        del known[next(iter(known))]
+    return judge_view(job, data, _judge_process["browser"])
+
+
+@dataclass
+class SceneJudging:
+    """A scene being judged from its group's running CLI: its views in camera order (cameras the reference lacks
+    carry that error), filled in as the jobs of the others are done."""
+
+    run: SceneRun
+    group: RenderGroup
+    cli: bluemap.BlueMapCli
+    views: list[ViewOutcome]
+    jobs: list[ViewJob]
+    pending: int = 0
+    started: float = math.inf  # the first view's start
+    ended: float = 0.0  # the last view's end
+
+    def __post_init__(self) -> None:
+        self.pending = len(self.jobs)
+
+    def judged(self, job: ViewJob, view: ViewOutcome, started: float) -> None:
+        self.views[job.index] = view
+        self.pending -= 1
+        self.started = min(self.started, started)
+        self.ended = time.monotonic()
+
+
+def open_scene(run: SceneRun, client_dir: Path | None, cli: bluemap.BlueMapCli, group: RenderGroup,
+               plan: CalibrationPlan, failed: list[str], translucent: frozenset[str]) -> SceneJudging | None:
+    """One job per camera the scene's reference has (``translucent``: the scene's [see_through_labels]); without any
+    the scene fails (the calibration scene the run calibrates on ends the run)."""
     out, scene, variant = run.out, run.scene, run.variant
-    # bluemap_render: the group's CLI (all scenes of the batch); total: this scene's views, comparison and report
-    timings: dict[str, float | None] = {"bluemap_render": round(cli.render_seconds, 1)}
-    if run.job.seconds is not None:
-        timings["reference_capture"] = round(float(run.job.seconds), 1)
     captured = [c for c in run.camera_list if client_dir is not None and (client_dir / f"{c.name}.json").is_file()]
-    if not captured:
-        raise RuntimeError(f"{variant.name}/{scene}: no reference captures (key {run.job.key.short}"
-                           f"{', log ' + str(run.job.log) if run.job.log else ''})")
-    calibrating = run.calibrating_pair and plan.compute
-    thresholds = None if calibrating else active_thresholds()
-    keys = dump_keys(run.blocks)
+    if client_dir is None or not captured:
+        why = (f"{variant.name}/{scene}: no reference captures (key {run.job.key.short}"
+               f"{', log ' + str(run.job.log) if run.job.log else ''})")
+        if run.calibrating_pair and plan.compute:
+            raise SystemExit(f"[oracle] the calibration scene failed, nothing can be judged: {why}")
+        print(f"[oracle] {why}", file=sys.stderr, flush=True)
+        failed.append(f"{variant.name}/{scene}")
+        return None
     root = out / "bluemap"
     for sub in ("config", "data", "web"):  # per-scene renders of earlier versions
         shutil.rmtree(root / sub, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     (root / "packs.txt").write_text("".join(f"{p}\n" for p in run.packs), encoding="utf-8")
-    bg = backgrounds(variant, run.blocks, run.removed, load_accepted(run.packs))
     views: list[ViewOutcome] = []
-    for cam in run.camera_list:
-        view = ViewOutcome(cam.name, cam.source)
-        views.append(view)
+    jobs: list[ViewJob] = []
+    for index, cam in enumerate(run.camera_list):
+        views.append(ViewOutcome(cam.name, cam.source))
         if cam not in captured:
-            view.error = "no reference capture"
-            continue
-        t0 = time.monotonic()
-        client = cameras.ClientView.load(client_dir, cam.name)
-        centre, radius = area(client, keys)
-        capture = webapp.capture(browser, cli.url, bluemap.map_id(scene), cameras.webapp_camera(client), centre,
-                                 radius, client.width, client.height)
-        t1 = time.monotonic()
-        view.faces, view.alignment, view.checks = compare_view(client, capture, run.blocks, keys, thresholds, out, bg)
-        view.seconds = {"webapp": round(t1 - t0, 1), "compare": round(time.monotonic() - t1, 1),
-                        "client": round(float(client.meta.get("seconds", 0.0)), 1)}
-        print(f"[oracle] {variant.name}/{scene}/{cam.name}: {len(view.faces)} faces, alignment "
-              f"{'ok' if view.alignment['passed'] else 'FAILED'} (shift {view.alignment['shift']}, "
-              f"edge median {view.alignment['edge_error_median_px']} px, p90 {view.alignment['edge_error_p90_px']} px), "
-              f"webapp {view.seconds['webapp']}s, compare {view.seconds['compare']}s", flush=True)
-    timings["total"] = round(time.monotonic() - started, 1)
+            views[-1].error = "no reference capture"
+        else:
+            jobs.append(ViewJob(variant, scene, tuple(run.packs), out, client_dir, cli.url, index, cam.name,
+                                cam.source, translucent))
+    return SceneJudging(run, group, cli, views, jobs)
+
+
+def close_scene(s: SceneJudging, plan: CalibrationPlan, summaries: dict[Path, dict], failed: list[str]) -> None:
+    """Judges a scene whose views are all done (calibrating first if it is the run's calibration scene), writes its
+    report and the variant's summary."""
+    t0 = time.monotonic()
+    run, cli = s.run, s.cli
+    out, scene, variant = run.out, run.scene, run.variant
+    # bluemap_render: the group's CLI (all scenes of the batch); total: from this scene's first view to its last
+    timings: dict[str, float | None] = {"bluemap_render": round(cli.render_seconds, 1)}
+    if run.job.seconds is not None:
+        timings["reference_capture"] = round(float(run.job.seconds), 1)
+    timings["total"] = round(max(s.ended - s.started, 0.0), 1)
     ref = json.loads((out / reference.REFERENCE).read_text(encoding="utf-8")) if (out / reference.REFERENCE).is_file() else {}
     base = {
         "scene": scene,
         "variant": variant.name,
         "bluemap_packs": [str(p) for p in run.packs],
-        "bluemap_batch": [r.scene for r in group.runs],
+        "bluemap_batch": [r.scene for r in s.group.runs],
         "client": {"dir": str(variant.client_dir), "resource_packs": [str(p) for p in variant.resource_packs],
                    "extra_mods": [str(p) for p in variant.extra_mods]},
         "reference": {k: ref.get(k) for k in ("key", "entry", "cached", "complete", "stale", "wanted_key", "log")
@@ -685,9 +849,101 @@ def run_scene(run: SceneRun, client_dir: Path | None, cli: bluemap.BlueMapCli, g
         "timings": timings,
         "bluemap_log_errors": cli.log_lines("ERROR")[:20],
     }
-    report = finish(out, base, views, calibrate_into=plan if calibrating else None)
-    update_summary(variant)
-    return report
+    report = finish(out, base, s.views, calibrate_into=plan if run.calibrating_pair and plan.compute else None)
+    summaries[out / "report.json"] = summary_entry(report)
+    update_summary(variant, summaries)
+    sm = report["summary"]
+    rate = "-" if sm["pass_rate"] is None else f"{sm['pass_rate']:.2%}"
+    print(f"[oracle] {variant.name}/{scene}: {sm['passed']}/{sm['judged']} faces pass ({rate}), "
+          f"{sm['views_aligned']}/{sm['views']} views aligned, {timings['total']:.0f}s, report "
+          f"{time.monotonic() - t0:.0f}s; {out / 'report.html'}", flush=True)
+    if sm["views_aligned"] < sm["views"]:
+        failed.append(f"{variant.name}/{scene}")
+
+
+def judge_serial(groups: list[RenderGroup], client_dirs: dict[int, Path | None], jars: bluemap.Jars,
+                 plan: CalibrationPlan, summaries: dict[Path, dict], failed: list[str]) -> None:
+    """``--jobs 1``: one group after another, one view after another, in this process with one Chromium."""
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+        try:
+            for group in groups:
+                cli = start_bluemap(group, jars)
+                try:
+                    for run in group.runs:
+                        translucent = see_through_labels(run.variant, {b.label for b in run.blocks.values()})
+                        s = open_scene(run, client_dirs[id(run)], cli, group, plan, failed, frozenset(translucent))
+                        if s is None:
+                            continue
+                        data = scene_data(run.variant, run.packs, run.blocks, run.removed, translucent)
+                        for job in s.jobs:
+                            view, started = judge_view(job, data, browser)
+                            s.judged(job, view, started)
+                            print(view_line(job, view), flush=True)
+                        close_scene(s, plan, summaries, failed)
+                finally:
+                    cli.stop()
+        finally:
+            browser.close()
+
+
+def judge_parallel(groups: list[RenderGroup], client_dirs: dict[int, Path | None], jars: bluemap.Jars,
+                   plan: CalibrationPlan, summaries: dict[Path, dict], failed: list[str], jobs: int) -> None:
+    """``--jobs N``: N judge processes, each with its own Chromium, capture and compare the views of every scene of
+    the run, in camera order per scene, as soon as the group's CLI serves them; the groups render one after another
+    meanwhile, the next while the views of the previous are judged. A scene is judged and reported as soon as its
+    last view is done, the run's calibration scene before any other; a group's CLI stops after its last scene."""
+    pool = ProcessPoolExecutor(jobs, mp_context=multiprocessing.get_context("spawn"),
+                               initializer=_judge_process_start)
+    renderer = ThreadPoolExecutor(1, thread_name_prefix="bluemap")
+    renders: dict[Future, RenderGroup] = {renderer.submit(start_bluemap, group, jars): group for group in groups}
+    # every scene's translucent states, read once here while the first group renders, not by each judge process
+    lookups = ThreadPoolExecutor(1, thread_name_prefix="see-through")
+    translucent = {id(run): lookups.submit(see_through_labels, run.variant, {b.label for b in run.blocks.values()})
+                   for group in groups for run in group.runs}
+    views: dict[Future, tuple[SceneJudging, ViewJob]] = {}
+    clis: list[bluemap.BlueMapCli] = []
+    open_scenes: dict[int, int] = {}  # per group: scenes not yet reported
+    done_scenes: list[SceneJudging] = []  # every view judged, not yet reported
+    calibrated = not plan.compute
+    try:
+        while renders or views:
+            finished, _ = wait([*renders, *views], return_when=FIRST_COMPLETED)
+            for future in finished:
+                if future in renders:
+                    group = renders.pop(future)
+                    cli = future.result()
+                    clis.append(cli)
+                    opened = [open_scene(run, client_dirs[id(run)], cli, group, plan, failed,
+                                         frozenset(translucent[id(run)].result())) for run in group.runs]
+                    opened = [s for s in opened if s is not None]
+                    open_scenes[id(group)] = len(opened)
+                    for s in opened:
+                        views.update({pool.submit(_judge_process_view, job): (s, job) for job in s.jobs})
+                    if not opened:
+                        cli.stop()
+                else:
+                    s, job = views.pop(future)
+                    view, started = future.result()
+                    s.judged(job, view, started)
+                    print(view_line(job, view), flush=True)
+                    if not s.pending:
+                        done_scenes.append(s)
+            while ready := [s for s in done_scenes if calibrated or s.run.calibrating_pair]:
+                s = ready[0]
+                done_scenes.remove(s)
+                close_scene(s, plan, summaries, failed)
+                calibrated = calibrated or s.run.calibrating_pair
+                open_scenes[id(s.group)] -= 1
+                if not open_scenes[id(s.group)]:
+                    s.cli.stop()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        renderer.shutdown(wait=True, cancel_futures=True)
+        lookups.shutdown(wait=True, cancel_futures=True)
+        clis += [f.result() for f in renders if not f.cancelled() and f.exception() is None]
+        for cli in clis:
+            cli.stop()
 
 
 def load_accepted(packs: list) -> accepted.Accepted:
@@ -759,7 +1015,7 @@ def rejudge(variant: variants.Variant, out: Path, *, recalibrate: bool = False) 
         distance = np.fromfile(depth, dtype="<f4").reshape(client.height, client.width)
         reference, _, ref_world = reference_labels(client)
         test, test_world = bluemap_labels(client, distance)
-        view.faces = face_records(client, reference, test, test_rgb, blocks, keys, None,
+        view.faces = face_records(client, reference, test, test_rgb, blocks, keys,
                                   colour_excluded(client, reference, ref_world, test, test_world, bg))
     base = {k: data.get(k) for k in ("scene", "variant", "bluemap_packs", "client", "excluded", "timings",
                                      "bluemap_log_errors")}
@@ -789,13 +1045,23 @@ def scene_blocks(scene: str) -> tuple[dict, list, list[str]]:
     return blocks, removed, removed_states
 
 
-def update_summary(variant: variants.Variant) -> Path:
-    """``out/oracle/<variant>/worlds/summary.json``: the summary of every scene report of the variant."""
+def summary_entry(report: dict) -> dict:
+    return {"scene": report["scene"], "summary": report["summary"], "timings": report["timings"],
+            "created": report["created"]}
+
+
+def update_summary(variant: variants.Variant, known: dict[Path, dict] | None = None) -> Path:
+    """``out/oracle/<variant>/worlds/summary.json``: the summary of every scene report of the variant. ``known``
+    (report path: ``summary_entry``) keeps the reports a run already read or wrote from being read again (the
+    end-game report alone is about 750 MB)."""
     root = variants.oracle_dir(variant) / "worlds"
+    known = {} if known is None else known
     scenes_summary = {}
     for report in sorted(root.glob("*/report.json")):
-        data = json.loads(report.read_text(encoding="utf-8"))
-        scenes_summary[data["scene"]] = {"summary": data["summary"], "timings": data["timings"], "created": data["created"]}
+        if report not in known:
+            known[report] = summary_entry(json.loads(report.read_text(encoding="utf-8")))
+        entry = known[report]
+        scenes_summary[entry["scene"]] = {k: entry[k] for k in ("summary", "timings", "created")}
     path = root / "summary.json"
     path.write_text(json.dumps({"variant": variant.name, "scenes": scenes_summary}, indent=2) + "\n", encoding="utf-8")
     return path
@@ -860,36 +1126,22 @@ def cmd_world(args: argparse.Namespace) -> int:
           f"capture {t_refs - t_keys:.1f}s", flush=True)
 
     jars = runner.prepare_jars(build=not args.no_build)
-    failed = []
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
-        try:
-            for group in render_groups(runs):
-                cli = start_bluemap(group, jars)
-                try:
-                    for run in group.runs:
-                        try:
-                            report = run_scene(run, client_dirs[id(run)], cli, group, browser, plan)
-                        except RuntimeError as e:
-                            if run.calibrating_pair and plan.compute:
-                                raise SystemExit(f"[oracle] the calibration scene failed, nothing can be judged: {e}")
-                            print(f"[oracle] {e}", file=sys.stderr, flush=True)
-                            failed.append(f"{run.variant.name}/{run.scene}")
-                            continue
-                        s = report["summary"]
-                        rate = "-" if s["pass_rate"] is None else f"{s['pass_rate']:.2%}"
-                        print(f"[oracle] {run.variant.name}/{run.scene}: {s['passed']}/{s['judged']} faces pass "
-                              f"({rate}), {s['views_aligned']}/{s['views']} views aligned, "
-                              f"{report['timings']['total']:.0f}s; {run.out / 'report.html'}", flush=True)
-                        if s["views_aligned"] < s["views"]:
-                            failed.append(f"{run.variant.name}/{run.scene}")
-                finally:
-                    cli.stop()
-        finally:
-            browser.close()
+    failed: list[str] = []
+    summaries: dict[Path, dict] = {}
+    if args.jobs == 1:
+        judge_serial(render_groups(runs), client_dirs, jars, plan, summaries, failed)
+    else:
+        judge_parallel(render_groups(runs), client_dirs, jars, plan, summaries, failed, args.jobs)
     print(f"[oracle] {len(runs)} scene runs in {time.monotonic() - started:.0f}s (references {t_refs - started:.0f}s)"
           + (f"; failed: {', '.join(failed)}" if failed else ""), flush=True)
     return 1 if failed else 0
+
+
+def _jobs(value: str) -> int:
+    jobs = int(value)
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("--jobs must be at least 1")
+    return jobs
 
 
 def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
@@ -914,6 +1166,10 @@ def add_parser(oracle_sub: argparse._SubParsersAction) -> None:
                    help=f"calibrate the thresholds again ({CALIBRATION_VARIANT}/{CALIBRATION_SCENE} must be in the run) "
                         f"instead of reusing the calibration stored for the current references")
     p.add_argument("--parallel", type=int, help="client instances for the reference captures (gtnh-client --parallel)")
+    p.add_argument("--jobs", type=_jobs, default=JOBS,
+                   help=f"views judged at once: processes that each capture BlueMap's webapp in their own headless "
+                        f"Chromium and compare it with the client (default {JOBS}); 1 judges one view after another "
+                        f"in this process")
     p.add_argument("--mod-jar", type=Path, help="exporter jar for the reference capture (default: the launcher builds it)")
     p.add_argument("--no-build", action="store_true", help="use the existing BlueMap CLI/addon jars")
     p.set_defaults(func=cmd_world)

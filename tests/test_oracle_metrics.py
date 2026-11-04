@@ -1,4 +1,5 @@
 import math
+from dataclasses import astuple
 
 import numpy as np
 import pytest
@@ -90,6 +91,50 @@ def test_structure_and_colour_errors_are_separated() -> None:
     assert s.ssim < 0.3 < t.ssim
     assert t.delta_e > 3
     assert metrics.compare_region(ref, ref).ssim > t.ssim
+
+
+def _bits(m: metrics.RegionMetrics) -> tuple:
+    return tuple(np.float64(v).tobytes() if isinstance(v, float) else v for v in astuple(m))
+
+
+@pytest.mark.parametrize("downsample", [1, 2])
+def test_compare_regions_is_compare_region_of_each_region(downsample: int) -> None:
+    rng = np.random.default_rng(6)
+    h, w = 90, 130
+    ref = np.concatenate([rng.integers(0, 256, (h // 2, w // 2, 3), dtype=np.uint8).repeat(2, 0).repeat(2, 1),
+                          np.full((h, w, 1), 255, np.uint8)], axis=2)
+    test = ref.copy()
+    test[..., :3] = np.clip(ref[..., :3] + rng.integers(-20, 20, (h, w, 3)), 0, 255)
+    ref[rng.random((h, w)) < 0.05, 3] = 0  # holes in the coverage
+    test[rng.random((h, w)) < 0.05, 3] = 60
+    y, x = np.indices((h, w))
+    ref_ids = (y // 23) * 10 + x // (11 + y // 30)  # boxes from a few pixels to wider than the SSIM window
+    ref_ids[(ref_ids % 7) == 3] = -1
+    test_ids = np.roll(ref_ids, (1, 2), axis=(0, 1))  # BlueMap's regions a little off
+    test_ids[:20, :20] = 59  # a region only BlueMap shows
+    for i, (py, px) in enumerate([(5, 70), (40, 3), (88, 128)]):  # regions of a single pixel
+        ref_ids[py, px] = test_ids[py, px] = 60 + i
+        ref[py, px, 3] = test[py, px, 3] = 255
+    excluded = rng.random((h, w)) < 0.1
+    count = 64  # 63 is in neither
+    batched = metrics.compare_regions(ref, test, ref_ids, test_ids, count, ssim_downsample=downsample,
+                                      colour_excluded=excluded)
+    single = [metrics.compare_region(ref, test, ref_ids == i, test_ids == i, ssim_downsample=downsample,
+                                     colour_excluded=excluded) for i in range(count)]
+    assert [_bits(m) for m in batched] == [_bits(m) for m in single]
+    assert sum(not math.isnan(m.ssim) for m in single) > 10 and sum(m.both_pixels == 1 for m in single) >= 3
+
+
+def test_segment_reductions_are_numpys() -> None:
+    rng = np.random.default_rng(8)
+    counts = np.concatenate([np.arange(1, 140), rng.integers(140, 5000, 30)])
+    values = rng.random(int(counts.sum())) * 40
+    segments = np.split(values, np.cumsum(counts)[:-1])
+    ordered = np.concatenate([np.sort(s) for s in segments])
+    assert metrics.segment_sums(values, counts).tobytes() == np.array([s.sum() for s in segments]).tobytes()
+    assert (metrics.segment_percentile(ordered, counts, 95).tobytes()
+            == np.array([np.percentile(s, 95) for s in segments]).tobytes())
+    assert metrics.segment_median(ordered, counts).tobytes() == np.array([np.median(s) for s in segments]).tobytes()
 
 
 def test_thresholds_check() -> None:

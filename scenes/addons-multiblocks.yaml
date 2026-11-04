@@ -3,13 +3,13 @@
 # creative) around controllers at y=20, z=0, facing north, structures extending south; superflat ground at y=4.
 # Controllers at x: TST artificial star 0, laser meteor miner 35, large solar boiler 58, eye of wood 88, intensify
 # chemical distorter 117, magnetic mixer 139, miracle top 166; GTNL mega EBF 195, large circuit assembler 215, large
-# steam furnace 231, meteor miner 251, large bronze boiler 269, nano phagocytosis plant 288; 123T SINOPEC 327, fire
-# rocket assembler 387, mega QFT 422, mega Isa forge 478; NHU arcane EBF 519; PH programming circuit provider 529;
-# Box++ encapsulator 549.
-# TESR row on a stone floor (y=4) at y=5, z=-48, x = 0, 8, ..., 184: TST star, laser beacon, eye of wood render, solar
+# steam furnace 231, meteor miner 251, large bronze boiler 269, nano phagocytosis plant 288; NHU arcane EBF 519; PH
+# programming circuit provider 529; Box++ encapsulator 549. (123Technology is not in the 2.9.0 addon set: no release
+# loads on 2.9.0, see orchestrator/README.md, so its SINOPEC, fire rocket assembler, mega QFT and mega Isa forge and
+# its TESR models are absent and have no views.)
+# TESR row on a stone floor (y=4) at y=5, z=-48, x = 0, 8, ..., 152: TST star, laser beacon, eye of wood render, solar
 # boiler render, arcane hole, power chair; GTNL beam former, laser beacon, essentia jar, essentia tube, artificial star
-# render, EGTW render, nano phagocytosis render, player doll, fumo, water candle, ender elevator; Box++ rings 1-3; 123T
-# rocket, Ayanami, Asuka, tall hat.
+# render, EGTW render, nano phagocytosis render, player doll, fumo, water candle, ender elevator; Box++ rings 1-3.
 # Active TESR row (tile entity NBT set with bmh te-nbt), y=5, z=-64: TST laser beacon (red beam, range 20) x 0, GTNL
 # laser beacon (blue, range 12) x 12, TST star (renderStatus 1) x 24, GTNL essentia jar (ignis + aqua) x 36, two GTNL
 # beam formers facing each other x 48 z -64 / -58, GTNL ender elevator meta 14 x 60, fumo meta 5 x 68, player doll
@@ -73,18 +73,6 @@ views:
     angle: 1.3
     distance: 0
     mode: free
-  oth-sinopec-rocket:     # 123T SINOPEC and fire rocket assembler
-    position: [357.5, 40, -50]
-    rotation: 3.14159
-    angle: 1.25
-    distance: 0
-    mode: free
-  oth-mega-isa-forge:
-    position: [478.5, 44, -56]
-    rotation: 3.14159
-    angle: 1.25
-    distance: 0
-    mode: free
   nhu-ph-boxpp:           # NHU arcane EBF, PH programming circuit provider, Box++ encapsulator
     position: [536.5, 26, -24]
     rotation: 3.14159
@@ -94,11 +82,6 @@ views:
   tesr-tst-gtnl:          # TESR row, TST + GTNL blocks (x 0..128)
     position: [64, 5, -48]
     distance: 40
-    rotation: 3.14159
-    angle: 1.0
-  tesr-boxpp-oth:         # TESR row, Box++ rings and 123T models (x 136..184)
-    position: [160, 5, -48]
-    distance: 22
     rotation: 3.14159
     angle: 1.0
   tesr-active-beams:      # active row: laser beacons, star, essentia jar, beam formers (x 0..48)

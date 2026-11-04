@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from e2e import bluemap
@@ -44,3 +46,22 @@ def test_map_ids_follow_bluemaps_sanitising(tmp_path: Path) -> None:
                                                       bluemap.MapSource("overworld", world, dim)], jars, 8200, [])
     assert sorted(p.name for p in (config / "maps").iterdir()) == ["gt_ores.conf", "overworld.conf"]
     assert f'world: "{world}"' in (config / "maps" / "gt_ores.conf").read_text()
+
+
+def test_reserved_ports_go_to_one_holder_until_released(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BMGTNH_WORKSPACE", str(tmp_path))
+    ports = range(28200, 28210)  # not the pipeline's: CLIs of a run on this machine do not get in the way
+    monkeypatch.setattr(bluemap, "PORTS", ports)
+    first, second = bluemap.free_port(), bluemap.free_port()
+    try:
+        assert first != second  # the first is reserved although nothing has bound it yet
+        code = f"from e2e import bluemap; bluemap.PORTS = range({ports.start}, {ports.stop}); print(bluemap.free_port())"
+        other = int(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout)
+        assert other not in (first, second)  # another process skips both
+        bluemap.release_port(first)
+        assert bluemap.free_port() == first
+        bluemap.BlueMapCli(bluemap.Jars(tmp_path / "cli.jar", ()), tmp_path, second).stop()  # never started: releases
+        assert bluemap.free_port() == second
+    finally:
+        for port in (first, second):
+            bluemap.release_port(port)

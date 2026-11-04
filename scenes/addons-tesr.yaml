@@ -33,11 +33,6 @@ views:
     distance: 5
     rotation: 3.14159
     angle: 0.9
-  oth-figures:            # 123T Ayanami, Asuka, tall hat
-    position: [176, 5.5, -48]
-    distance: 6
-    rotation: 3.14159
-    angle: 1.1
   active-gtnl:            # filled jar, paired beam formers, ender elevator (red), fumo (east), doll (south)
     position: [56, 5, -62]
     distance: 14

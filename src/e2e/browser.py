@@ -190,6 +190,11 @@ class Chromium:
                 console_errors.append(message.text)
 
         def on_request_failed(request: Request) -> None:
+            # The webapp polls /live/ (markers, players) on a timer and aborts a poll still in flight when it reloads
+            # the map or the page closes; seen as `net::ERR_ABORTED` on an otherwise identical frame (diff 0.000%) when
+            # several e2e/oracle runs share the CPU. The CLI serves no live data, so such an abort is not a failure.
+            if "/live/" in request.url and request.failure == "net::ERR_ABORTED":
+                return
             failed.append(f"{request.method} {request.url}: {request.failure}")
 
         def on_response(response: Response) -> None:

@@ -3,7 +3,8 @@
 Per variant (outputs in ``out/oracle/<variant>/states/``, never committed):
 
 1. Reference: ``client/`` links to the cached capture of ``gtnh-client states`` (sibling gtnh-exporter launcher, run
-   on a cache miss; ``oracle.reference``): every block state the exporter knows (vanilla ones from the fork's
+   on a cache miss; ``oracle.reference``; a local copy instead of a link when the cache is on a file system shared
+   with the host, ``reference.copies_states``): every block state the exporter knows (vanilla ones from the fork's
    flattening table), drawn alone by the real client at two fixed orthographic views, with per-pixel face IDs and
    ``client/index.json``.
 2. BlueMap: ``bluemap/`` from the fork module ``oracle`` (``./gradlew :oracle:renderStates``): the same states
@@ -26,10 +27,12 @@ renders the thresholds flag.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import Counter, defaultdict
@@ -72,20 +75,51 @@ def calibration_target() -> tuple[dict, Path | None]:
 
 # --- BlueMap side ------------------------------------------------------------------------------------------------
 
-def render_bluemap(variant: variants.Variant, out: Path, log: Path, threads: int | None = None) -> None:
-    """Runs the fork's ``:oracle:renderStates`` for the client index of ``out``."""
-    repo = paths.bluemap_repo()
-    args = ["--index", str(out / "client" / "index.json"), "--out", str(out / "bluemap"),
-            "--mc-cache", str(paths.download_cache())]
+def bluemap_packs(variant: variants.Variant, out: Path) -> list[Path]:
+    """The variant's packs as the BlueMap side reads them: BlueMap reads a pack entry by entry, and on a file system
+    shared with the host every read is a round trip to the host (no page cache), so such a pack is copied (one
+    sequential read) to ``out/packs/`` first unless ``out`` is shared too."""
+    if reference.host_shared(out):
+        return list(variant.bluemap_packs)
+    packs = []
     for pack in variant.bluemap_packs:
-        args += ["--pack", str(pack)]
-    if threads:
-        args += ["--threads", str(threads)]
-    cmd = ["mise", "exec", "--", "./gradlew", "--console=plain", ":oracle:renderStates", f"--args={subprocess.list2cmdline(args)}"]
-    log.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[states] BlueMap side: {subprocess.list2cmdline(cmd)} (log {log})", flush=True)
-    with log.open("w", encoding="utf-8") as stream:
-        result = subprocess.run(cmd, cwd=repo, stdout=stream, stderr=subprocess.STDOUT)
+        if reference.host_shared(pack):
+            copy = out / "packs" / pack.name
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(pack, copy)
+            pack = copy
+        packs.append(pack)
+    return packs
+
+
+def render_bluemap(variant: variants.Variant, out: Path, log: Path, threads: int | None = None) -> None:
+    """Runs the fork's ``:oracle:renderStates`` for the client index of ``out``.
+
+    It writes two PNGs per state (125,000 files) by absolute path. When that path crosses a file system shared with
+    the host (``out`` on a volume below the dev container's ``/ws``), each of those writes looked up ``/ws/out`` there
+    first, a round trip to the host per component, and the render waited on that (115 s for 62,659 states, 5% CPU).
+    So in that case it gets ``out`` as ``/proc/<pid>/fd/<n>`` of a directory descriptor this process holds open, which
+    the kernel follows without looking up the components above it."""
+    repo = paths.bluemap_repo()
+    with contextlib.ExitStack() as stack:
+        target = out
+        if reference.crosses_host_shared(out) and Path(f"/proc/{os.getpid()}/fd").is_dir():
+            fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
+            stack.callback(os.close, fd)
+            target = Path(f"/proc/{os.getpid()}/fd/{fd}")
+            print(f"[states] BlueMap side writes {out} as {target}", flush=True)
+        args = ["--index", str(out / "client" / "index.json"), "--out", str(target / "bluemap"),
+                "--mc-cache", str(paths.download_cache())]
+        for pack in bluemap_packs(variant, out):
+            args += ["--pack", str(pack)]
+        if threads:
+            args += ["--threads", str(threads)]
+        cmd = ["mise", "exec", "--", "./gradlew", "--console=plain", ":oracle:renderStates",
+               f"--args={subprocess.list2cmdline(args)}"]
+        log.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[states] BlueMap side: {subprocess.list2cmdline(cmd)} (log {log})", flush=True)
+        with log.open("w", encoding="utf-8") as stream:
+            result = subprocess.run(cmd, cwd=repo, stdout=stream, stderr=subprocess.STDOUT)
     if result.returncode != 0:
         tail = "".join(log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-30:])
         raise bluemap.BlueMapError(f":oracle:renderStates failed (exit {result.returncode}), log {log}:\n{tail}")
@@ -316,15 +350,18 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
     pattern = re.compile(only) if only else None
     states = [s for s in client_index["states"] if not pattern or pattern.search(s["key"]) or pattern.search(s["name"])]
 
-    jobs = [(s["path"], str(out / "client"), str(out / "bluemap")) for s in states if s["path"] in bm_states]
+    # paths relative to `out`, the workers' working directory: through an absolute path every component under the
+    # workspace costs a lookup on the host-shared file system in the dev container (see reference.copy_reference)
+    jobs = [(s["path"], "client", "bluemap") for s in states if s["path"] in bm_states]
     raw: dict[str, dict] = {}
     load_errors: dict[str, str] = {}
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(max_workers=workers, initializer=os.chdir, initargs=(out,)) as pool:
         for path, views, error in pool.map(_compare_job, jobs, chunksize=64):
             if views is None:
                 load_errors[path] = error or "unreadable"
             else:
                 raw[path] = views
+    t_loaded = time.monotonic()
 
     results = []
     for s in states:
@@ -425,6 +462,9 @@ def run(variant: variants.Variant, *, render: bool, only: str | None, workers: i
           f"({totals['passRate']:.2%}), {totals['accepted']} {accepted.LABEL}; {totals['clientBlank']} client-blank, "
           f"{totals['clientError']} client errors, {totals['bluemapMissing']} without BlueMap output; compare "
           f"{t_end - t_compare:.0f}s; report {out / 'report.html'}")
+    print(f"[states] phases: BlueMap side {t_compare - t_render:.0f}s, images loaded and compared "
+          f"{t_loaded - t_compare:.0f}s ({len(jobs)} states, {workers} processes), judged {t_end - t_loaded:.0f}s, "
+          f"report {time.monotonic() - t_end:.0f}s; run {time.monotonic() - started:.0f}s", flush=True)
     return 0 if totals["fail"] == 0 else 1
 
 

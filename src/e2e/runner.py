@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from playwright.sync_api import sync_playwright
 
 from e2e import bluemap, metrics, paths
 from e2e.browser import Capture, Chromium
 from e2e.scenes import Scene, View
+
+# Scenes at a time: one scene kept 26% of 32 CPUs busy on average (its CLI's render, then one view after another)
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) // 10)
 
 
 @dataclass
@@ -157,6 +165,48 @@ def run_scene(scene: Scene, jars: bluemap.Jars, chromium: Chromium, extra_packs:
     result.total_seconds = time.monotonic() - started
     (out / "report.json").write_text(json.dumps(asdict(result), indent=2, default=str), encoding="utf-8")
     return result
+
+
+def run_scenes(specs: list[Scene], jars: bluemap.Jars, extra_packs: tuple[Path, ...], jobs: int,
+               done: Callable[[SceneResult], None]) -> list[SceneResult]:
+    """Runs the scenes ``specs``, up to ``jobs`` at a time, and returns their results in that order; ``done`` gets each
+    result when its scene finishes (one call at a time). Each worker thread has a Playwright instance and headless
+    Chromium of its own (Playwright's sync API stays on the thread that started it) and takes the next scene when it
+    finishes one; every scene has a CLI of its own (``bluemap.free_port`` reserves its port). The first error stops the
+    workers from starting further scenes and is raised once the running ones are done."""
+    pending = list(enumerate(specs))
+    results: list[SceneResult | None] = [None] * len(specs)
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker() -> None:
+        try:
+            with sync_playwright() as playwright:
+                chromium = Chromium(playwright)
+                try:
+                    while True:
+                        with guard:
+                            if errors or not pending:
+                                return
+                            index, spec = pending.pop(0)
+                        result = run_scene(spec, jars, chromium, extra_packs)
+                        with guard:
+                            results[index] = result
+                            done(result)
+                finally:
+                    chromium.close()
+        except BaseException as e:  # raised again by the calling thread
+            with guard:
+                errors.append(e)
+
+    threads = [threading.Thread(target=worker, name=f"e2e-scenes-{i}") for i in range(max(1, min(jobs, len(specs))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return [r for r in results if r is not None]
 
 
 def approve(scene: Scene, views: list[str]) -> list[Path]:

@@ -1,12 +1,21 @@
-"""Unit tests of the world oracle: camera conventions, unprojection, face labelling, alignment, depth decoding."""
+"""Unit tests of the world oracle: camera conventions, unprojection, face labelling, alignment, depth decoding,
+judging schedule."""
 
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import astuple
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
+from e2e import metrics as image_metrics
 from e2e import scenes
 from e2e.oracle import accepted, camera, faces, metrics, webapp, world
 
@@ -173,6 +182,86 @@ def test_compare_faces_of_identical_renderings():
     assert all(r.metrics.iou == 0.0 and r.metrics.test_pixels == 0 for r in missing)
 
 
+def test_compare_faces_is_compare_region_of_each_face():
+    client, points, hit = _scene()
+    reference = faces.label(points, hit, client.eye)
+    # BlueMap's labels a pixel to the right, its left third a block nearer: occlusion in both directions
+    test = faces.Labels(faces._shift(reference.key, 1, 0, -1), faces._shift(reference.residual, 1, 0, np.nan),
+                        faces._shift(reference.distance, 1, 0, np.nan))
+    test.distance[:, :W // 3] -= 1.0
+    rng = np.random.default_rng(5)
+    ref_rgba = np.concatenate([rng.integers(0, 256, (H, W, 3)), np.full((H, W, 1), 255)], axis=-1).astype(np.uint8)
+    test_rgba = ref_rgba.copy()
+    test_rgba[..., :3] = np.clip(ref_rgba[..., :3] + rng.integers(-15, 15, (H, W, 3)), 0, 255)
+    excluded = rng.random((H, W)) < 0.1
+    keys = np.unique(reference.key[reference.key >= 0])
+    results = faces.compare_faces(ref_rgba, test_rgba, reference, test, keys[::-1], excluded)  # any key order
+    regions = {}
+    for key in keys.tolist():
+        own_regions = []
+        for own, other in ((reference, test), (test, reference)):
+            with np.errstate(invalid="ignore"):
+                nearer = other.distance < own.distance - (faces.OCCLUSION_TOLERANCE + 0.002 * own.distance)
+            own_regions.append((own.key == key) & ((other.key == key) | ~nearer))
+        if own_regions[0].any() or own_regions[1].any():
+            regions[key] = own_regions
+    assert [r.key for r in results] == list(regions) and len(results) > 10
+    for r in results:
+        ref_region, test_region = regions[r.key]
+        expected = metrics.compare_region(ref_rgba, test_rgba, ref_region, test_region, colour_excluded=excluded)
+        assert [np.float64(v).tobytes() for v in astuple(r.metrics)] == [np.float64(v).tobytes()
+                                                                         for v in astuple(expected)]
+        rows, cols = np.nonzero(ref_region | test_region)
+        assert r.bbox == (cols.min(), rows.min(), cols.max() + 1, rows.max() + 1)
+        source, labels = (ref_region, reference) if ref_region.any() else (test_region, test)
+        assert r.planar == float((labels.residual[source] < faces.PLANAR_EPSILON).mean())
+        assert r.distance == float(np.median(labels.distance[source]))
+        assert (r.x, r.y, r.z, r.face) == faces.decode(r.key)
+
+
+def test_face_records_count_magenta_and_excluded_pixels_in_the_face_box():
+    client, points, hit = _scene()
+    reference = faces.label(points, hit, client.eye)
+    test = faces.Labels(faces._shift(reference.key, 1, 0, -1), faces._shift(reference.residual, 1, 0, np.nan),
+                        faces._shift(reference.distance, 1, 0, np.nan))
+    test.distance[:, :W // 3] -= 1.0
+    rng = np.random.default_rng(9)
+    client.image[...] = rng.integers(0, 256, (H, W, 3))
+    test_rgb = rng.integers(0, 256, (H, W, 3)).astype(np.uint8)
+    test_rgb[rng.random((H, W)) < 0.2] = (200, 0, 200)  # missing texture
+    excluded = rng.random((H, W)) < 0.2
+    blocks = {cube: world.Block(f"test:block{i}", i, None) for i, cube in enumerate(CUBES)}
+    records = world.face_records(client, reference, test, test_rgb, blocks, world.dump_keys(blocks), excluded)
+    magenta = image_metrics.magenta_mask(test_rgb)
+    assert len(records) > 10 and any(r["magenta"] for r in records) and any(r["background_excluded"] for r in records)
+    for r in records:
+        key = int(faces.encode(np.array([r["x"], r["y"], r["z"]]), np.array(faces.FACES.index(r["face"]))))
+        x0, y0, x1, y1 = r["bbox"]
+        box = (slice(y0, y1), slice(x0, x1))
+        test_region = test.key[box] == key  # occluded pixels too
+        assert r["magenta"] == round(float(magenta[box][test_region].mean()) if test_region.any() else 0.0, 3)
+        assert r["background_excluded"] == int((excluded[box] & ((reference.key[box] == key) | test_region)).sum())
+        assert (r["block"], r["meta"]) == (blocks[r["x"], r["y"], r["z"]].name, blocks[r["x"], r["y"], r["z"]].meta)
+
+
+def test_see_through_labels_read_each_render_once_per_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(world.variants, "oracle_dir", lambda v: tmp_path / (v if isinstance(v, str) else v.name))
+    client = tmp_path / "default" / "states" / "client"
+    client.mkdir(parents=True)
+    alpha = {"glass": 120, "stone": 255}
+    for name, a in alpha.items():
+        Image.new("RGBA", (8, 8), (90, 90, 90, a)).save(client / f"{name}.png")
+    states_index = [{"name": f"test:{n}", "meta": 0, "path": n} for n in alpha]
+    (client / "index.json").write_text(json.dumps({"states": states_index}))
+    variant = SimpleNamespace(name="default")
+    labels = {"test:glass:0", "test:stone:0", "test:unknown:0"}
+    assert world.see_through_labels(variant, labels) == {"test:glass:0"}
+    (client / "glass.png").unlink()  # the verdicts of this capture are kept
+    assert world.see_through_labels(variant, labels) == {"test:glass:0"}
+    (client / "index.json").write_text(json.dumps({"states": states_index[1:]}))  # another capture: read again
+    assert world.see_through_labels(variant, labels) == set()
+
+
 def _cube_distances(eye: np.ndarray, rays: np.ndarray, cubes: list) -> np.ndarray:
     """(len(cubes), H, W) distance along each ray to each cube (inf = miss)."""
     return np.stack([_raycast(eye, rays, [c]) for c in cubes])
@@ -265,3 +354,115 @@ def test_judge_reports_accepted_faces_apart(tmp_path):
     s = world.summarize([view])
     assert (s["judged"], s["passed"], s["accepted"]) == (2, 1, 1)
     assert s["per_mod"]["minecraft"]["accepted"] == 1 and s["per_mod"]["minecraft"]["pass_rate"] is None
+
+
+class _ThreadPool(ThreadPoolExecutor):
+    """The judge processes as threads: the fakes below cannot be pickled to a spawned process."""
+
+    def __init__(self, workers: int, mp_context=None, initializer=None) -> None:
+        super().__init__(workers)
+
+
+class _FakeCli:
+    def __init__(self, group: world.RenderGroup) -> None:
+        self.url = f"http://{group.variant.name}/"
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def _schedule(tmp_path, monkeypatch, judge, clis: list[_FakeCli]) -> tuple[list, list[str]]:
+    """``judge_parallel`` over two groups with fake CLIs (appended to ``clis``) and judge jobs: default (vanilla-zoo,
+    which calibrates, and gt-ores), modernity (vanilla-zoo, and gt-pipes without a reference)."""
+    default, modernity = SimpleNamespace(name="default"), SimpleNamespace(name="modernity")
+    client = tmp_path / "client"
+    client.mkdir()
+    for name in ("a", "b", "c"):
+        (client / f"{name}.json").write_text("{}")
+    cams = [SimpleNamespace(name=n, source="perspective") for n in ("a", "b", "c", "missing")]
+    key = SimpleNamespace(key=SimpleNamespace(short="k"), log=None, seconds=None)
+
+    def run(variant, scene: str) -> world.SceneRun:
+        return world.SceneRun(variant, scene, tmp_path / variant.name / scene, cams, {}, [], [], key, [])
+
+    runs = [run(default, "vanilla-zoo"), run(default, "gt-ores"), run(modernity, "vanilla-zoo"),
+            run(modernity, "gt-pipes")]
+    groups = [world.RenderGroup(default, [], runs[:2], tmp_path), world.RenderGroup(modernity, [], runs[2:], tmp_path)]
+    client_dirs = {id(r): None if r.scene == "gt-pipes" else client for r in runs}
+    closed: list = []
+
+    def start(group, jars):
+        clis.append(_FakeCli(group))
+        return clis[-1]
+
+    def close(s, plan, summaries, failed):
+        closed.append((s.run.variant.name, s.run.scene, [(v.name, v.error) for v in s.views], s.cli.stopped))
+
+    monkeypatch.setattr(world, "ProcessPoolExecutor", _ThreadPool)
+    monkeypatch.setattr(world, "start_bluemap", start)
+    monkeypatch.setattr(world, "_judge_process_view", judge)
+    monkeypatch.setattr(world, "close_scene", close)
+    failed: list[str] = []
+    world.judge_parallel(groups, client_dirs, None, world.CalibrationPlan(True, None, None), {}, failed, 4)
+    return closed, failed
+
+
+def _judged(job: world.ViewJob) -> tuple[world.ViewOutcome, float]:
+    alignment = {"passed": True, "shift": [0.0, 0.0], "edge_error_median_px": 0.0, "edge_error_p90_px": 0.0}
+    return world.ViewOutcome(job.camera, job.source, alignment=alignment, seconds={"webapp": 0, "compare": 0}), 0.0
+
+
+def test_parallel_judging_reports_the_calibration_scene_first(tmp_path, monkeypatch):
+    def judge(job):  # the calibration scene's views are the slowest: the others are done first and wait
+        time.sleep(0.3 if (job.variant.name, job.scene) == ("default", "vanilla-zoo") else 0.01)
+        return _judged(job)
+
+    clis: list[_FakeCli] = []
+    reports, failed = _schedule(tmp_path, monkeypatch, judge, clis)
+    assert [(variant, scene) for variant, scene, _, _ in reports][0] == ("default", "vanilla-zoo")
+    assert sorted((variant, scene) for variant, scene, _, _ in reports) == [
+        ("default", "gt-ores"), ("default", "vanilla-zoo"), ("modernity", "vanilla-zoo")]
+    for _, _, views, stopped in reports:  # camera order; the CLI serves until its group's last scene is reported
+        assert views == [("a", None), ("b", None), ("c", None), ("missing", "no reference capture")]
+        assert not stopped
+    assert failed == ["modernity/gt-pipes"]
+    assert len(clis) == 2 and all(cli.stopped for cli in clis)
+
+
+def test_parallel_judging_stops_every_cli_when_a_view_fails(tmp_path, monkeypatch):
+    def judge(job):
+        if job.camera == "b":
+            raise RuntimeError("compare failed")
+        return _judged(job)
+
+    clis: list[_FakeCli] = []
+    with pytest.raises(RuntimeError, match="compare failed"):
+        _schedule(tmp_path, monkeypatch, judge, clis)
+    assert clis and all(cli.stopped for cli in clis)
+
+
+def test_update_summary_reads_each_report_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(world.variants, "oracle_dir", lambda variant: tmp_path)
+    for scene in ("a", "b"):
+        (tmp_path / "worlds" / scene).mkdir(parents=True)
+        (tmp_path / "worlds" / scene / "report.json").write_text(json.dumps(
+            {"scene": scene, "summary": {"passed": 1}, "timings": {"total": 2.0}, "created": "then", "faces": []}))
+    known = {tmp_path / "worlds" / "b" / "report.json": world.summary_entry(
+        {"scene": "b", "summary": {"passed": 5}, "timings": {"total": 1.0}, "created": "now"})}
+    variant = SimpleNamespace(name="default")
+    world.update_summary(variant, known)
+    (tmp_path / "worlds" / "a" / "report.json").write_text("not read again")
+    path = world.update_summary(variant, known)
+    data = json.loads(path.read_text())
+    assert data["scenes"] == {"a": {"summary": {"passed": 1}, "timings": {"total": 2.0}, "created": "then"},
+                              "b": {"summary": {"passed": 5}, "timings": {"total": 1.0}, "created": "now"}}
+
+
+def test_jobs_option():
+    parser = argparse.ArgumentParser()
+    world.add_parser(parser.add_subparsers())
+    assert parser.parse_args(["world"]).jobs == world.JOBS >= 1
+    assert parser.parse_args(["world", "--jobs", "1"]).jobs == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(["world", "--jobs", "0"])

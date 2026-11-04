@@ -1,7 +1,8 @@
 # Community addon block zoo (`orch --server gtnh-addons --port 25568 --rcon-port 25578 scene addons-zoo`,
 # orchestrator/src/orchestrator/addon_scenes.py): superflat, one bmh zoo grid per addon at y=5 (stone floor
-# y=4), side by side along +x: TST x 0..26 z 0..26, GTNL x 32..54 z 0..22, PH x 60..76 z 0..14, 123T x 82..86 z 0..4,
-# NHU x 92..96 z 0..2, Box++ x 102..114 z 0..10. Addon jars: <workspace>/downloads/addons/versions.json.
+# y=4), side by side along +x: TST x 0..26 z 0..26, GTNL x 32..54 z 0..22, PH x 60..76 z 0..14, NHU x 82..86 z 0..2,
+# Box++ x 92..104 z 0..10 (123Technology has no release that loads on 2.9.0). Addon jars:
+# <workspace>/downloads/addons/versions.json.
 # The zoo also places metas the addons never use (TST MetaBlock01 1..15, SpaceTime* 3..15, ...: damageDropped(m) == m
 # but no icon), which render as missing cubes.
 world: addons-zoo
@@ -35,8 +36,18 @@ views:
     distance: 22
     rotation: 0.6
     angle: 1.0
-  small-addons:           # 123Technology, NH Utilities, Box++
+  small-addons:           # NH Utilities, Box++
     position: [98, 5, 5]
     distance: 26
     rotation: 0.6
     angle: 1.0
+
+oracle:
+  # Zoo metas whose client rendering throws, set to air for the capture and not judged (one such block fails its whole
+  # chunk's mesh; the client's renderer then did not recover from BetterCrashes' reset and drew no frame at all).
+  # Box++ 2.2.0.0 BlockBoxModuleCore (both module blocks) has 15 icons, getIcon(side, meta) = ModuleIcon[meta] and
+  # getSubBlocks lists metas 0..14: meta 15 throws ArrayIndexOutOfBoundsException (client crash report of the first
+  # capture, 2026-11-03: boxmoduleplus meta 15 at (94,5,6)).
+  exclude:
+    "boxplusplus:boxplusplus_boxmodule": [15]
+    "boxplusplus:boxplusplus_boxmoduleplus": [15]
